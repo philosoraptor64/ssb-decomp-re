@@ -3,6 +3,8 @@
 #include <sys/netpeer.h>
 #include <sys/taskman.h>
 
+extern void port_log(const char *fmt, ...);
+
 typedef struct SYNetInputSlot
 {
 	SYNetInputSource source;
@@ -20,6 +22,9 @@ SYNetInputFrame sSYNetInputSavedHistory[MAXCONTROLLERS][SYNETINPUT_HISTORY_LENGT
  * the peer applies it. Packets send these future-tagged samples. */
 SYNetInputFrame sSYNetInputLocalDelayHistory[MAXCONTROLLERS][SYNETINPUT_HISTORY_LENGTH];
 u32 sSYNetInputLocalDelay;
+/* Hardware controller state for this tick, saved before published frames
+ * overwrite gSYControllerDevices[]. */
+SYController sSYNetInputPhysicalDevices[MAXCONTROLLERS];
 SYNetInputFrame sSYNetInputReplayFrames[MAXCONTROLLERS][SYNETINPUT_REPLAY_MAX_FRAMES];
 SYNetInputReplayMetadata sSYNetInputReplayMetadata;
 u32 sSYNetInputTick;
@@ -208,9 +213,32 @@ void syNetInputSetSavedInput(s32 player, u32 tick, u16 buttons, s8 stick_x, s8 s
 	}
 }
 
+/* Netplay diagnostics: every 120 local samples, log how far the local
+ * player's stick travelled in each direction (N64 full tilt is about 80). */
+void syNetInputLogLocalStickRange(SYNetInputFrame *frame)
+{
+	static s32 count, min_x, max_x, min_y, max_y;
+
+	if (count == 0)
+	{
+		min_x = max_x = frame->stick_x;
+		min_y = max_y = frame->stick_y;
+	}
+	if (frame->stick_x < min_x) min_x = frame->stick_x;
+	if (frame->stick_x > max_x) max_x = frame->stick_x;
+	if (frame->stick_y < min_y) min_y = frame->stick_y;
+	if (frame->stick_y > max_y) max_y = frame->stick_y;
+
+	if (++count == 120)
+	{
+		port_log("SSB64 NetInput: local stick x=[%d,%d] y=[%d,%d] tick=%u\n", min_x, max_x, min_y, max_y, frame->tick);
+		count = 0;
+	}
+}
+
 void syNetInputMakeLocalFrame(s32 player, u32 tick, SYNetInputFrame *out_frame)
 {
-	SYController *controller = &gSYControllerDevices[player];
+	SYController *controller = &sSYNetInputPhysicalDevices[syNetPeerGetControllerPort(player)];
 
 	syNetInputMakeFrame
 	(
@@ -223,6 +251,11 @@ void syNetInputMakeLocalFrame(s32 player, u32 tick, SYNetInputFrame *out_frame)
 		FALSE
 	);
 	syNetPeerGetDebugBotInput(player, tick, &out_frame->buttons, &out_frame->stick_x, &out_frame->stick_y);
+
+	if (syNetPeerCheckLocalPlayer(player) != FALSE)
+	{
+		syNetInputLogLocalStickRange(out_frame);
+	}
 }
 
 /* Enables delayed local input (0 = publish local input on the tick it is
@@ -604,6 +637,10 @@ void syNetInputFuncRead(void)
 	s32 player;
 
 	syControllerFuncRead();
+	for (player = 0; player < MAXCONTROLLERS; player++)
+	{
+		sSYNetInputPhysicalDevices[player] = gSYControllerDevices[player];
+	}
 	tick = syNetInputGetTick();
 
 	if (syNetPeerCheckStartBarrierReleased() != FALSE)

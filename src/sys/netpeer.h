@@ -12,6 +12,8 @@ extern void syNetPeerUpdateBattleGate(void);
 extern void syNetPeerUpdate(void);
 extern void syNetPeerStopVSSession(void);
 extern void syNetPeerWaitForRemoteInput(u32 tick);
+extern sb32 syNetPeerCheckLocalPlayer(s32 player);
+extern s32 syNetPeerGetControllerPort(s32 player);
 extern sb32 syNetPeerGetDebugBotInput(s32 player, u32 tick, u16 *buttons, s8 *stick_x, s8 *stick_y);
 
 #endif /* _SYNETPEER_H_ */

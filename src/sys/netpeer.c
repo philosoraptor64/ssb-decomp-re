@@ -1535,6 +1535,18 @@ void syNetPeerUpdate(void)
 	syNetPeerLogStats();
 }
 
+// Online, the one local player is driven by this machine's first controller,
+// whatever player slot the match assigned it.
+sb32 syNetPeerCheckLocalPlayer(s32 player)
+{
+	return ((sSYNetPeerIsActive != FALSE) && (player == sSYNetPeerLocalPlayer)) ? TRUE : FALSE;
+}
+
+s32 syNetPeerGetControllerPort(s32 player)
+{
+	return (syNetPeerCheckLocalPlayer(player) != FALSE) ? 0 : player;
+}
+
 // Debug bot: deterministic pseudo-random input for the local netplay player,
 // a pure function of (player, tick). Each choice is held for 12 ticks, with
 // buttons pressed only for the first 3 so attacks re-trigger. Never START.
