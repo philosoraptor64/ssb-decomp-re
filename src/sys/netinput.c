@@ -15,6 +15,11 @@ SYNetInputSlot sSYNetInputSlots[MAXCONTROLLERS];
 SYNetInputFrame sSYNetInputHistory[MAXCONTROLLERS][SYNETINPUT_HISTORY_LENGTH];
 SYNetInputFrame sSYNetInputRemoteHistory[MAXCONTROLLERS][SYNETINPUT_HISTORY_LENGTH];
 SYNetInputFrame sSYNetInputSavedHistory[MAXCONTROLLERS][SYNETINPUT_HISTORY_LENGTH];
+/* Delay-based netplay: local input sampled at tick t is stored here tagged
+ * t + sSYNetInputLocalDelay and only published at that tick, the same tick
+ * the peer applies it. Packets send these future-tagged samples. */
+SYNetInputFrame sSYNetInputLocalDelayHistory[MAXCONTROLLERS][SYNETINPUT_HISTORY_LENGTH];
+u32 sSYNetInputLocalDelay;
 SYNetInputFrame sSYNetInputReplayFrames[MAXCONTROLLERS][SYNETINPUT_REPLAY_MAX_FRAMES];
 SYNetInputReplayMetadata sSYNetInputReplayMetadata;
 u32 sSYNetInputTick;
@@ -103,6 +108,7 @@ void syNetInputReset(void)
 	s32 i;
 
 	sSYNetInputTick = 0;
+	sSYNetInputLocalDelay = 0;
 	sSYNetInputRecordedFrameCount = 0;
 	sSYNetInputIsRecording = FALSE;
 	sSYNetInputIsReplayMetadataValid = FALSE;
@@ -149,6 +155,7 @@ void syNetInputReset(void)
 			syNetInputClearFrame(&sSYNetInputHistory[player][i]);
 			syNetInputClearFrame(&sSYNetInputRemoteHistory[player][i]);
 			syNetInputClearFrame(&sSYNetInputSavedHistory[player][i]);
+			syNetInputClearFrame(&sSYNetInputLocalDelayHistory[player][i]);
 		}
 		for (i = 0; i < SYNETINPUT_REPLAY_MAX_FRAMES; i++)
 		{
@@ -215,6 +222,60 @@ void syNetInputMakeLocalFrame(s32 player, u32 tick, SYNetInputFrame *out_frame)
 		nSYNetInputSourceLocal,
 		FALSE
 	);
+	syNetPeerGetDebugBotInput(player, tick, &out_frame->buttons, &out_frame->stick_x, &out_frame->stick_y);
+}
+
+/* Enables delayed local input (0 = publish local input on the tick it is
+ * sampled, as in offline VS). Ticks before the delay publish neutral input. */
+void syNetInputSetLocalInputDelay(u32 delay)
+{
+	SYNetInputFrame frame;
+	s32 player;
+	u32 tick;
+
+	sSYNetInputLocalDelay = delay;
+
+	for (player = 0; player < MAXCONTROLLERS; player++)
+	{
+		for (tick = 0; tick < delay; tick++)
+		{
+			syNetInputMakeFrame(&frame, tick, 0, 0, 0, nSYNetInputSourceLocal, FALSE);
+			syNetInputStoreFrame(sSYNetInputLocalDelayHistory, player, &frame);
+		}
+	}
+}
+
+u32 syNetInputGetLocalInputDelay(void)
+{
+	return sSYNetInputLocalDelay;
+}
+
+sb32 syNetInputCheckRemoteFrame(s32 player, u32 tick)
+{
+	return syNetInputGetStoredFrame(sSYNetInputRemoteHistory, player, tick, NULL);
+}
+
+sb32 syNetInputGetDelayedLocalFrame(s32 player, u32 tick, SYNetInputFrame *out_frame)
+{
+	return syNetInputGetStoredFrame(sSYNetInputLocalDelayHistory, player, tick, out_frame);
+}
+
+void syNetInputResolveDelayedLocalFrame(s32 player, u32 tick, SYNetInputFrame *out_frame)
+{
+	SYNetInputFrame sample;
+
+	/* Sample only on ticks that will actually advance, so the frames held at
+	 * tick 0 behind the start barrier don't rewrite an already-sent sample. */
+	if (syNetPeerCheckStartBarrierReleased() != FALSE)
+	{
+		syNetInputMakeLocalFrame(player, tick, &sample);
+		sample.tick = tick + sSYNetInputLocalDelay;
+		syNetInputStoreFrame(sSYNetInputLocalDelayHistory, player, &sample);
+	}
+	if (syNetInputGetStoredFrame(sSYNetInputLocalDelayHistory, player, tick, out_frame) == FALSE)
+	{
+		syNetInputMakeFrame(out_frame, tick, 0, 0, 0, nSYNetInputSourceLocal, FALSE);
+	}
 }
 
 void syNetInputMakePredictedFrame(s32 player, u32 tick, SYNetInputFrame *out_frame)
@@ -264,7 +325,11 @@ void syNetInputResolveFrame(s32 player, u32 tick, SYNetInputFrame *out_frame)
 
 	case nSYNetInputSourceLocal:
 	default:
-		syNetInputMakeLocalFrame(player, tick, out_frame);
+		if (sSYNetInputLocalDelay != 0)
+		{
+			syNetInputResolveDelayedLocalFrame(player, tick, out_frame);
+		}
+		else syNetInputMakeLocalFrame(player, tick, out_frame);
 		break;
 	}
 }
@@ -540,6 +605,11 @@ void syNetInputFuncRead(void)
 
 	syControllerFuncRead();
 	tick = syNetInputGetTick();
+
+	if (syNetPeerCheckStartBarrierReleased() != FALSE)
+	{
+		syNetPeerWaitForRemoteInput(tick);
+	}
 
 	for (player = 0; player < MAXCONTROLLERS; player++)
 	{

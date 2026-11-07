@@ -11,5 +11,7 @@ extern sb32 syNetPeerCheckStartBarrierReleased(void);
 extern void syNetPeerUpdateBattleGate(void);
 extern void syNetPeerUpdate(void);
 extern void syNetPeerStopVSSession(void);
+extern void syNetPeerWaitForRemoteInput(u32 tick);
+extern sb32 syNetPeerGetDebugBotInput(s32 player, u32 tick, u16 *buttons, s8 *stick_x, s8 *stick_y);
 
 #endif /* _SYNETPEER_H_ */

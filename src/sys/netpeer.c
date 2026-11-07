@@ -22,6 +22,7 @@ extern void port_watchdog_note_yield(void);
 #include <netinet/in.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 #endif
 
@@ -44,6 +45,10 @@ extern void port_watchdog_note_yield(void);
 // handshake itself (two processes launched together reach this point up to
 // ~15s apart on macOS), so the first wait gets its own ~60s budget.
 #define SYNETPEER_BOOTSTRAP_PEER_WAIT_COUNT 3600
+#define SYNETPEER_LOCKSTEP_POLL_USECS 500
+#define SYNETPEER_LOCKSTEP_RESEND_USECS 4000
+#define SYNETPEER_LOCKSTEP_TIMEOUT_USECS 5000000
+#define SYNETPEER_SIM_QUEUE_LENGTH 256
 #define SYNETPEER_BOOTSTRAP_RETRY_USECS 16666
 #define SYNETPEER_BARRIER_LOG_INTERVAL 30
 #define SYNETPEER_BATTLE_START_REPEAT_FRAMES 30
@@ -78,6 +83,17 @@ u32 sSYNetPeerPacketsDropped;
 u32 sSYNetPeerFramesStaged;
 u32 sSYNetPeerLateFrames;
 u32 sSYNetPeerInputChecksum;
+sb32 sSYNetPeerDebugBotIsEnabled;
+sb32 sSYNetPeerLockstepIsEnabled;
+u32 sSYNetPeerStallTicks;
+u32 sSYNetPeerStallUsecs;
+u32 sSYNetPeerStallTimeouts;
+// Debug network simulator for input packets (SSB64_NETPLAY_SIM_*).
+u32 sSYNetPeerSimLossPercent;
+u32 sSYNetPeerSimLatencyUsecs;
+u32 sSYNetPeerSimJitterUsecs;
+u32 sSYNetPeerSimRandom;
+u32 sSYNetPeerSimDropped;
 u32 sSYNetPeerLastLogTick;
 u32 sSYNetPeerSendSeq;
 u32 sSYNetPeerRecvSeqHighWater;
@@ -754,6 +770,11 @@ void syNetPeerInitDebugEnv(void)
 
 	sSYNetPeerIsEnabled = FALSE;
 	sSYNetPeerIsConfigured = FALSE;
+	sSYNetPeerDebugBotIsEnabled = FALSE;
+	sSYNetPeerLockstepIsEnabled = TRUE;
+	sSYNetPeerSimLossPercent = 0;
+	sSYNetPeerSimLatencyUsecs = 0;
+	sSYNetPeerSimJitterUsecs = 0;
 	sSYNetPeerLocalPlayer = 0;
 	sSYNetPeerRemotePlayer = 1;
 	sSYNetPeerInputDelay = SYNETPEER_DEFAULT_INPUT_DELAY;
@@ -834,6 +855,32 @@ void syNetPeerInitDebugEnv(void)
 			sSYNetPeerBootstrapSeed = seed;
 		}
 	}
+	// SSB64_NETPLAY_BOT=1 drives the local player with scripted input so a
+	// pair can be sync-tested in real gameplay without anyone at the keys.
+	if ((getenv("SSB64_NETPLAY_BOT") != NULL) && (atoi(getenv("SSB64_NETPLAY_BOT")) != 0))
+	{
+		sSYNetPeerDebugBotIsEnabled = TRUE;
+	}
+	// SSB64_NETPLAY_LOCKSTEP=0 restores the old behavior of predicting late
+	// remote input (which desyncs, as nothing ever corrects the guess).
+	if ((getenv("SSB64_NETPLAY_LOCKSTEP") != NULL) && (atoi(getenv("SSB64_NETPLAY_LOCKSTEP")) == 0))
+	{
+		sSYNetPeerLockstepIsEnabled = FALSE;
+	}
+	// Simulated bad network for input packets: SIM_LOSS is a drop percentage,
+	// SIM_LATENCY_MS a one-way delay and SIM_JITTER_MS a random extra delay.
+	if (getenv("SSB64_NETPLAY_SIM_LOSS") != NULL)
+	{
+		sSYNetPeerSimLossPercent = atoi(getenv("SSB64_NETPLAY_SIM_LOSS"));
+	}
+	if (getenv("SSB64_NETPLAY_SIM_LATENCY_MS") != NULL)
+	{
+		sSYNetPeerSimLatencyUsecs = atoi(getenv("SSB64_NETPLAY_SIM_LATENCY_MS")) * 1000;
+	}
+	if (getenv("SSB64_NETPLAY_SIM_JITTER_MS") != NULL)
+	{
+		sSYNetPeerSimJitterUsecs = atoi(getenv("SSB64_NETPLAY_SIM_JITTER_MS")) * 1000;
+	}
 	if ((sSYNetPeerLocalPlayer < 0) || (sSYNetPeerLocalPlayer >= MAXCONTROLLERS) ||
 		(sSYNetPeerRemotePlayer < 0) || (sSYNetPeerRemotePlayer >= MAXCONTROLLERS) ||
 		(sSYNetPeerLocalPlayer == sSYNetPeerRemotePlayer))
@@ -873,6 +920,9 @@ void syNetPeerStartVSSession(void)
 		return;
 	}
 	sSYNetPeerHighestRemoteTick = 0;
+	sSYNetPeerStallTicks = 0;
+	sSYNetPeerStallUsecs = 0;
+	sSYNetPeerStallTimeouts = 0;
 	sSYNetPeerPacketsSent = 0;
 	sSYNetPeerPacketsReceived = 0;
 	sSYNetPeerPacketsDropped = 0;
@@ -901,6 +951,7 @@ void syNetPeerStartVSSession(void)
 	sSYNetPeerExecutionBeginLogged = (sSYNetPeerBattleBarrierEnabled == FALSE) ? TRUE : FALSE;
 
 	syNetInputSetSlotSource(sSYNetPeerLocalPlayer, nSYNetInputSourceLocal);
+	syNetInputSetLocalInputDelay(sSYNetPeerInputDelay);
 	syNetInputSetSlotSource(sSYNetPeerRemotePlayer, nSYNetInputSourceRemotePredicted);
 
 	port_log("SSB64 NetPeer: VS session start role=%s local=%d remote=%d delay=%u barrier=%d tick=%u\n",
@@ -946,14 +997,17 @@ void syNetPeerBuildPacket(u8 *buffer, u32 *out_size)
 		*out_size = 0;
 		return;
 	}
-	latest_tick = published_frame.tick;
+	// The newest local sample is tagged published tick + delay; send the last
+	// 16 of those future-tagged samples as-is (the peer applies each one on
+	// the same tick we do).
+	latest_tick = published_frame.tick + syNetInputGetLocalInputDelay();
 
 	for (back = SYNETPEER_MAX_PACKET_FRAMES - 1; back >= 0; back--)
 	{
 		if ((latest_tick >= (u32)back) &&
-			(syNetInputGetHistoryFrame(sSYNetPeerLocalPlayer, latest_tick - back, &history_frame) != FALSE))
+			(syNetInputGetDelayedLocalFrame(sSYNetPeerLocalPlayer, latest_tick - back, &history_frame) != FALSE))
 		{
-			frames[frame_count].tick = history_frame.tick + sSYNetPeerInputDelay;
+			frames[frame_count].tick = history_frame.tick;
 			frames[frame_count].buttons = history_frame.buttons;
 			frames[frame_count].stick_x = history_frame.stick_x;
 			frames[frame_count].stick_y = history_frame.stick_y;
@@ -994,6 +1048,90 @@ void syNetPeerBuildPacket(u8 *buffer, u32 *out_size)
 	*out_size = SYNETPEER_PACKET_BYTES;
 }
 
+#if defined(PORT) && !defined(_WIN32)
+typedef struct SYNetPeerSimPacket
+{
+	u64 release_usecs;
+	u32 size;
+	u8 data[SYNETPEER_PACKET_BYTES];
+
+} SYNetPeerSimPacket;
+
+SYNetPeerSimPacket sSYNetPeerSimQueue[SYNETPEER_SIM_QUEUE_LENGTH];
+u32 sSYNetPeerSimQueueCount;
+
+u64 syNetPeerSimNowUsecs(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+
+	return ((u64)ts.tv_sec * 1000000) + ((u64)ts.tv_nsec / 1000);
+}
+
+u32 syNetPeerSimNextRandom(void)
+{
+	// xorshift32; network simulation only, never gameplay state.
+	if (sSYNetPeerSimRandom == 0)
+	{
+		sSYNetPeerSimRandom = 0x2545F491U ^ (u32)sSYNetPeerLocalPlayer;
+	}
+	sSYNetPeerSimRandom ^= sSYNetPeerSimRandom << 13;
+	sSYNetPeerSimRandom ^= sSYNetPeerSimRandom >> 17;
+	sSYNetPeerSimRandom ^= sSYNetPeerSimRandom << 5;
+
+	return sSYNetPeerSimRandom;
+}
+
+void syNetPeerSimFlush(void)
+{
+	u64 now = syNetPeerSimNowUsecs();
+	u32 i = 0;
+
+	while (i < sSYNetPeerSimQueueCount)
+	{
+		if (sSYNetPeerSimQueue[i].release_usecs <= now)
+		{
+			syNetPeerSendBytes(sSYNetPeerSimQueue[i].data, sSYNetPeerSimQueue[i].size);
+			sSYNetPeerSimQueue[i] = sSYNetPeerSimQueue[--sSYNetPeerSimQueueCount];
+		}
+		else i++;
+	}
+}
+
+// Returns TRUE if the packet left (or was deliberately lost in) the simulator.
+sb32 syNetPeerSimSend(const u8 *buffer, u32 size)
+{
+	SYNetPeerSimPacket *packet;
+
+	if ((sSYNetPeerSimLossPercent == 0) && (sSYNetPeerSimLatencyUsecs == 0) && (sSYNetPeerSimJitterUsecs == 0))
+	{
+		return (sendto(sSYNetPeerSocket, buffer, size, 0, (struct sockaddr*)&sSYNetPeerPeerAddress,
+		               sizeof(sSYNetPeerPeerAddress)) == (ssize_t)size) ? TRUE : FALSE;
+	}
+	syNetPeerSimFlush();
+
+	if ((syNetPeerSimNextRandom() % 100) < sSYNetPeerSimLossPercent)
+	{
+		sSYNetPeerSimDropped++;
+		return TRUE;
+	}
+	if ((sSYNetPeerSimQueueCount >= SYNETPEER_SIM_QUEUE_LENGTH) || (size > SYNETPEER_PACKET_BYTES))
+	{
+		sSYNetPeerSimDropped++;
+		return TRUE;
+	}
+	packet = &sSYNetPeerSimQueue[sSYNetPeerSimQueueCount++];
+	packet->release_usecs = syNetPeerSimNowUsecs() + sSYNetPeerSimLatencyUsecs +
+		((sSYNetPeerSimJitterUsecs != 0) ? (syNetPeerSimNextRandom() % sSYNetPeerSimJitterUsecs) : 0);
+	packet->size = size;
+	memcpy(packet->data, buffer, size);
+	syNetPeerSimFlush();
+
+	return TRUE;
+}
+#endif
+
 void syNetPeerSendLocalInput(void)
 {
 #if defined(PORT) && !defined(_WIN32)
@@ -1006,8 +1144,7 @@ void syNetPeerSendLocalInput(void)
 	{
 		return;
 	}
-	if (sendto(sSYNetPeerSocket, buffer, size, 0,
-	           (struct sockaddr*)&sSYNetPeerPeerAddress, sizeof(sSYNetPeerPeerAddress)) == (ssize_t)size)
+	if (syNetPeerSimSend(buffer, size) != FALSE)
 	{
 		sSYNetPeerPacketsSent++;
 		sSYNetPeerSendSeq++;
@@ -1160,6 +1297,8 @@ void syNetPeerReceiveRemoteInput(void)
 #if defined(PORT) && !defined(_WIN32)
 	u8 buffer[SYNETPEER_PACKET_BYTES];
 
+	syNetPeerSimFlush();
+
 	while (TRUE)
 	{
 		ssize_t size = recvfrom(sSYNetPeerSocket, buffer, sizeof(buffer), 0, NULL, NULL);
@@ -1243,7 +1382,7 @@ void syNetPeerLogStats(void)
 	}
 	sSYNetPeerLastLogTick = tick;
 
-	port_log("SSB64 NetPeer: role=%s local=%d remote=%d barrier=%d execution_ready=%d tick=%u sent=%u recv=%u dropped=%u staged=%u highest_remote=%u late=%u snd_next=%u rcv_hw=%u seq_gap=%u seq_dup=%u seq_ooo=%u peer_ack=%u inpchk=0x%08X\n",
+	port_log("SSB64 NetPeer: role=%s local=%d remote=%d barrier=%d execution_ready=%d tick=%u sent=%u recv=%u dropped=%u staged=%u highest_remote=%u late=%u snd_next=%u rcv_hw=%u seq_gap=%u seq_dup=%u seq_ooo=%u peer_ack=%u inpchk=0x%08X stalls=%u stall_ms=%u\n",
 	         (sSYNetPeerBootstrapIsHost != FALSE) ? "host" : "client",
 	         sSYNetPeerLocalPlayer, sSYNetPeerRemotePlayer,
 	         sSYNetPeerBattleBarrierReleased, syNetPeerCheckBattleExecutionReady(), tick,
@@ -1252,7 +1391,7 @@ void syNetPeerLogStats(void)
 	         sSYNetPeerSendSeq, sSYNetPeerRecvSeqHighWater, sSYNetPeerSeqGaps,
 	         sSYNetPeerSeqDuplicates, sSYNetPeerSeqOutOfOrder,
 	         sSYNetPeerLastPeerAckTick,
-	         sSYNetPeerInputChecksum);
+	         sSYNetPeerInputChecksum, sSYNetPeerStallTicks, sSYNetPeerStallUsecs / 1000);
 
 	syNetPeerLogNetSyncValidation(tick);
 #endif
@@ -1396,11 +1535,95 @@ void syNetPeerUpdate(void)
 	syNetPeerLogStats();
 }
 
+// Debug bot: deterministic pseudo-random input for the local netplay player,
+// a pure function of (player, tick). Each choice is held for 12 ticks, with
+// buttons pressed only for the first 3 so attacks re-trigger. Never START.
+sb32 syNetPeerGetDebugBotInput(s32 player, u32 tick, u16 *buttons, s8 *stick_x, s8 *stick_y)
+{
+	static const s8 sticks[] = { -80, -40, 0, 0, 40, 80 };
+	u32 h;
+
+	if ((sSYNetPeerDebugBotIsEnabled == FALSE) || (sSYNetPeerIsActive == FALSE) ||
+		(player != sSYNetPeerLocalPlayer))
+	{
+		return FALSE;
+	}
+	h = ((tick / 12) + 1) * 2654435761U;
+	h ^= (u32)(player + 1) * 0x9E3779B9U;
+	h ^= h >> 15;
+	h *= 0x85EBCA6BU;
+	h ^= h >> 13;
+
+	*stick_x = sticks[h % 6];
+	*stick_y = (((h >> 8) % 8) == 0) ? 80 : ((((h >> 8) % 8) == 1) ? -80 : 0);
+	*buttons = 0;
+
+	if ((tick % 12) < 3)
+	{
+		switch ((h >> 16) % 10)
+		{
+		case 0: case 1: case 2: *buttons = A_BUTTON; break;
+		case 3: case 4: *buttons = B_BUTTON; break;
+		case 5: *buttons = Z_TRIG; break;
+		case 6: *buttons = U_CBUTTONS; break;
+		default: break;
+		}
+	}
+	return TRUE;
+}
+
+// Lockstep: block the game tick until the peer's input for it has arrived,
+// so remote input is never guessed. Each side has already sent its input
+// delay ticks ahead, so with delay >= 1 the two can never wait on each
+// other. While waiting, resend our latest packet in case it was lost.
+void syNetPeerWaitForRemoteInput(u32 tick)
+{
+#if defined(PORT) && !defined(_WIN32)
+	u32 waited_usecs = 0;
+
+	if ((sSYNetPeerIsActive == FALSE) || (sSYNetPeerLockstepIsEnabled == FALSE) ||
+		(sSYNetPeerInputDelay == 0))
+	{
+		return;
+	}
+	syNetPeerReceiveRemoteInput();
+
+	if (syNetInputCheckRemoteFrame(sSYNetPeerRemotePlayer, tick) != FALSE)
+	{
+		return;
+	}
+	sSYNetPeerStallTicks++;
+
+	while (syNetInputCheckRemoteFrame(sSYNetPeerRemotePlayer, tick) == FALSE)
+	{
+		if (waited_usecs >= SYNETPEER_LOCKSTEP_TIMEOUT_USECS)
+		{
+			sSYNetPeerStallTimeouts++;
+			port_log("SSB64 NetPeer: lockstep timeout tick=%u highest_remote=%u; peer lost, predicting from now on\n",
+			         tick, sSYNetPeerHighestRemoteTick);
+			sSYNetPeerLockstepIsEnabled = FALSE;
+			break;
+		}
+		if ((waited_usecs % SYNETPEER_LOCKSTEP_RESEND_USECS) == 0)
+		{
+			syNetPeerSendLocalInput();
+		}
+		usleep(SYNETPEER_LOCKSTEP_POLL_USECS);
+		waited_usecs += SYNETPEER_LOCKSTEP_POLL_USECS;
+		port_watchdog_note_yield();
+		syNetPeerReceiveRemoteInput();
+	}
+	sSYNetPeerStallUsecs += waited_usecs;
+#endif
+}
+
 void syNetPeerStopVSSession(void)
 {
 #if defined(PORT) && !defined(_WIN32)
 	if (sSYNetPeerIsActive != FALSE)
 	{
+		port_log("SSB64 NetPeer: lockstep stalls=%u stall_ms=%u timeouts=%u sim_dropped=%u\n",
+		         sSYNetPeerStallTicks, sSYNetPeerStallUsecs / 1000, sSYNetPeerStallTimeouts, sSYNetPeerSimDropped);
 		port_log("SSB64 NetPeer: VS session stop sent=%u recv=%u dropped=%u staged=%u late=%u checksum=0x%08X\n",
 		         sSYNetPeerPacketsSent, sSYNetPeerPacketsReceived, sSYNetPeerPacketsDropped,
 		         sSYNetPeerFramesStaged, sSYNetPeerLateFrames, sSYNetPeerInputChecksum);
