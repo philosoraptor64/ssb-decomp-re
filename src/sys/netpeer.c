@@ -13,6 +13,12 @@ extern char *getenv(const char *name);
 extern int atoi(const char *s);
 extern void port_log(const char *fmt, ...);
 extern void port_watchdog_note_yield(void);
+#if defined(PORT) && !defined(_WIN32)
+struct sockaddr_in;
+// port/net: find the peer through the n64net rendezvous server
+// (SSB64_NETPLAY_SERVER / SSB64_NETPLAY_ROOM). Returns 0 on success.
+extern int port_netplay_rendezvous(int sock, int is_host, struct sockaddr_in *out_peer);
+#endif
 #endif
 
 #if defined(PORT) && !defined(_WIN32)
@@ -146,6 +152,7 @@ u32 sSYNetPeerExecutionHoldFrames;
 sb32 sSYNetPeerExecutionBeginLogged;
 
 #if defined(PORT) && !defined(_WIN32)
+sb32 sSYNetPeerUseRendezvous;
 s32 sSYNetPeerSocket = -1;
 struct sockaddr_in sSYNetPeerBindAddress;
 struct sockaddr_in sSYNetPeerPeerAddress;
@@ -399,7 +406,8 @@ sb32 syNetPeerParseIPv4Address(const char *text, struct sockaddr_in *out_address
 
 	port = atoi(colon + 1);
 
-	if ((port <= 0) || (port > 65535))
+	// Port 0 = any free port (binding), or "to be filled in" (room codes).
+	if ((port < 0) || (port > 65535))
 	{
 		return FALSE;
 	}
@@ -790,6 +798,13 @@ void syNetPeerRunBootstrap(void)
 	{
 		return;
 	}
+	if ((sSYNetPeerUseRendezvous != FALSE) &&
+		(port_netplay_rendezvous(sSYNetPeerSocket, sSYNetPeerBootstrapIsHost != FALSE, &sSYNetPeerPeerAddress) != 0))
+	{
+		port_log("SSB64 NetPeer: room-code connection failed; playing offline\n");
+		syNetPeerCloseSocket();
+		return;
+	}
 	sSYNetPeerIsActive = TRUE;
 
 	if (sSYNetPeerBootstrapIsHost != FALSE)
@@ -919,6 +934,29 @@ void syNetPeerInitDebugEnv(void)
 	bootstrap_host_env = getenv("SSB64_NETPLAY_HOST");
 	bootstrap_seed_env = getenv("SSB64_NETPLAY_SEED");
 
+#if !defined(_WIN32)
+	// Room-code netplay: the server introduces the two players, so no
+	// addresses are needed. The host plays P1 and the guest P2 unless the
+	// player env vars say otherwise.
+	sSYNetPeerUseRendezvous = (getenv("SSB64_NETPLAY_SERVER") != NULL) && (getenv("SSB64_NETPLAY_SERVER")[0] != '\0');
+
+	if (sSYNetPeerUseRendezvous != FALSE)
+	{
+		sb32 is_host = (bootstrap_host_env != NULL) && (atoi(bootstrap_host_env) != 0);
+
+		if (bind_env == NULL)
+		{
+			bind_env = "0.0.0.0:0";
+		}
+		peer_env = "0.0.0.0:0"; // filled in by the rendezvous
+		if (bootstrap_env == NULL)
+		{
+			bootstrap_env = "1";
+		}
+		sSYNetPeerLocalPlayer = (is_host != FALSE) ? 0 : 1;
+		sSYNetPeerRemotePlayer = (is_host != FALSE) ? 1 : 0;
+	}
+#endif
 	if (local_player_env != NULL)
 	{
 		sSYNetPeerLocalPlayer = atoi(local_player_env);
