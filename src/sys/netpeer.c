@@ -37,6 +37,9 @@ extern void port_watchdog_note_yield(void);
 #define SYNETPEER_METADATA_BYTES (11 * 4 + 8 + (MAXCONTROLLERS * 7))
 #define SYNETPEER_BOOTSTRAP_PACKET_BYTES (4 + 2 + 2 + 4 + SYNETPEER_METADATA_BYTES + 4)
 #define SYNETPEER_CONTROL_PACKET_BYTES (4 + 2 + 2 + 4 + 4)
+#if defined(PORT) && !defined(_WIN32)
+void syNetPeerHandleTimingPacket(const u8 *buffer, s32 size);
+#endif
 #define SYNETPEER_DEFAULT_INPUT_DELAY 2
 #define SYNETPEER_DEFAULT_SESSION_ID 1
 #define SYNETPEER_DEFAULT_BOOTSTRAP_SEED 12345
@@ -60,6 +63,10 @@ extern void port_watchdog_note_yield(void);
 #define SYNETPEER_PACKET_START 3
 #define SYNETPEER_PACKET_BATTLE_READY 4
 #define SYNETPEER_PACKET_BATTLE_START 5
+#define SYNETPEER_PACKET_PING 6
+#define SYNETPEER_PACKET_PONG 7
+#define SYNETPEER_TIMING_PACKET_BYTES (4 + 2 + 2 + 4 + 4 + 4)
+#define SYNETPEER_PING_INTERVAL 15 // ticks between round-trip probes
 
 typedef struct SYNetPeerPacketFrame
 {
@@ -424,6 +431,24 @@ sb32 syNetPeerOpenSocket(void)
 	}
 	setsockopt(sSYNetPeerSocket, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
 
+	// Ask for low-latency treatment (Wi-Fi WMM voice queue): input packets
+	// are tiny and time-critical. SSB64_NETPLAY_QOS=0 turns it off for A/B
+	// tests.
+	if ((getenv("SSB64_NETPLAY_QOS") == NULL) || (atoi(getenv("SSB64_NETPLAY_QOS")) != 0))
+	{
+		s32 tos = 0xB8; // DSCP EF
+#ifdef SO_NET_SERVICE_TYPE
+		s32 service = NET_SERVICE_TYPE_VO;
+
+		setsockopt(sSYNetPeerSocket, SOL_SOCKET, SO_NET_SERVICE_TYPE, &service, sizeof(service));
+#endif
+#ifdef IP_TOS
+		setsockopt(sSYNetPeerSocket, IPPROTO_IP, IP_TOS, &tos, sizeof(tos));
+#endif
+		(void)tos;
+		port_log("SSB64 NetPeer: low-latency QoS requested\n");
+	}
+
 	if (bind(sSYNetPeerSocket, (struct sockaddr*)&sSYNetPeerBindAddress, sizeof(sSYNetPeerBindAddress)) != 0)
 	{
 		port_log("SSB64 NetPeer: bind failed errno=%d\n", errno);
@@ -693,6 +718,10 @@ void syNetPeerHandleBootstrapPacket(const u8 *buffer, s32 size)
 	else if (size == SYNETPEER_BOOTSTRAP_PACKET_BYTES)
 	{
 		syNetPeerHandleMatchConfigPacket(buffer, size);
+	}
+	else if (size == SYNETPEER_TIMING_PACKET_BYTES)
+	{
+		syNetPeerHandleTimingPacket(buffer, size);
 	}
 	else sSYNetPeerPacketsDropped++;
 }
@@ -1200,6 +1229,101 @@ void syNetPeerSendLocalInput(void)
 #endif
 }
 
+#if defined(PORT) && !defined(_WIN32)
+// Round-trip probes: PING carries the sender's clock (usecs), PONG echoes it.
+// Measurement only; nothing here affects gameplay.
+u32 sSYNetPeerPingCountdown;
+u32 sSYNetPeerRttWindowCount;
+u32 sSYNetPeerRttWindowSumUsecs;
+u32 sSYNetPeerRttWindowMaxUsecs;
+u32 sSYNetPeerRttMaxUsecs;
+u32 sSYNetPeerRttHistogram[5]; // <20, <50, <100, <150, >=150 ms
+
+void syNetPeerSendTimingPacket(u16 packet_type, u32 stamp)
+{
+	u8 buffer[SYNETPEER_TIMING_PACKET_BYTES];
+	u8 *cursor = buffer;
+	u32 checksum;
+
+	syNetPeerWriteU32(&cursor, SYNETPEER_MAGIC);
+	syNetPeerWriteU16(&cursor, SYNETPEER_VERSION);
+	syNetPeerWriteU16(&cursor, packet_type);
+	syNetPeerWriteU32(&cursor, sSYNetPeerSessionID);
+	syNetPeerWriteU32(&cursor, stamp);
+	checksum = syNetPeerChecksumBytes(buffer, cursor - buffer);
+	syNetPeerWriteU32(&cursor, checksum);
+	syNetPeerSimSend(buffer, SYNETPEER_TIMING_PACKET_BYTES);
+}
+
+void syNetPeerHandleTimingPacket(const u8 *buffer, s32 size)
+{
+	const u8 *cursor = buffer;
+	u32 magic, session_id, stamp, checksum, rtt;
+	u16 version, packet_type;
+
+	if (size != SYNETPEER_TIMING_PACKET_BYTES)
+	{
+		return;
+	}
+	magic = syNetPeerReadU32(&cursor);
+	version = syNetPeerReadU16(&cursor);
+	packet_type = syNetPeerReadU16(&cursor);
+	session_id = syNetPeerReadU32(&cursor);
+	stamp = syNetPeerReadU32(&cursor);
+	checksum = syNetPeerReadU32(&cursor);
+
+	if ((magic != SYNETPEER_MAGIC) || (version != SYNETPEER_VERSION) || (session_id != sSYNetPeerSessionID) ||
+		(checksum != syNetPeerChecksumBytes(buffer, SYNETPEER_TIMING_PACKET_BYTES - 4)))
+	{
+		sSYNetPeerPacketsDropped++;
+		return;
+	}
+	if (packet_type == SYNETPEER_PACKET_PING)
+	{
+		syNetPeerSendTimingPacket(SYNETPEER_PACKET_PONG, stamp);
+		return;
+	}
+	if (packet_type != SYNETPEER_PACKET_PONG)
+	{
+		return;
+	}
+	rtt = (u32)syNetPeerSimNowUsecs() - stamp;
+
+	sSYNetPeerRttWindowCount++;
+	sSYNetPeerRttWindowSumUsecs += rtt;
+	if (rtt > sSYNetPeerRttWindowMaxUsecs)
+	{
+		sSYNetPeerRttWindowMaxUsecs = rtt;
+	}
+	if (rtt > sSYNetPeerRttMaxUsecs)
+	{
+		sSYNetPeerRttMaxUsecs = rtt;
+	}
+	sSYNetPeerRttHistogram[(rtt < 20000) ? 0 : (rtt < 50000) ? 1 : (rtt < 100000) ? 2 : (rtt < 150000) ? 3 : 4]++;
+}
+
+void syNetPeerUpdatePing(void)
+{
+	if (sSYNetPeerPingCountdown == 0)
+	{
+		syNetPeerSendTimingPacket(SYNETPEER_PACKET_PING, (u32)syNetPeerSimNowUsecs());
+		sSYNetPeerPingCountdown = SYNETPEER_PING_INTERVAL;
+	}
+	sSYNetPeerPingCountdown--;
+}
+
+void syNetPeerLogRtt(void)
+{
+	if (sSYNetPeerRttWindowCount != 0)
+	{
+		port_log("SSB64 NetPeer: rtt avg=%ums max=%ums n=%u\n",
+		         sSYNetPeerRttWindowSumUsecs / sSYNetPeerRttWindowCount / 1000, sSYNetPeerRttWindowMaxUsecs / 1000,
+		         sSYNetPeerRttWindowCount);
+	}
+	sSYNetPeerRttWindowCount = sSYNetPeerRttWindowSumUsecs = sSYNetPeerRttWindowMaxUsecs = 0;
+}
+#endif
+
 void syNetPeerHandlePacket(const u8 *buffer, s32 size)
 {
 	const u8 *cursor = buffer;
@@ -1222,6 +1346,11 @@ void syNetPeerHandlePacket(const u8 *buffer, s32 size)
 	if (size == SYNETPEER_CONTROL_PACKET_BYTES)
 	{
 		syNetPeerHandleControlPacket(buffer, size);
+		return;
+	}
+	if (size == SYNETPEER_TIMING_PACKET_BYTES)
+	{
+		syNetPeerHandleTimingPacket(buffer, size);
 		return;
 	}
 #endif
@@ -1429,6 +1558,9 @@ void syNetPeerLogStats(void)
 		return;
 	}
 	sSYNetPeerLastLogTick = tick;
+#ifndef _WIN32
+	syNetPeerLogRtt();
+#endif
 
 	port_log("SSB64 NetPeer: role=%s local=%d remote=%d barrier=%d execution_ready=%d tick=%u sent=%u recv=%u dropped=%u staged=%u highest_remote=%u late=%u snd_next=%u rcv_hw=%u seq_gap=%u seq_dup=%u seq_ooo=%u peer_ack=%u inpchk=0x%08X stalls=%u stall_ms=%u\n",
 	         (sSYNetPeerBootstrapIsHost != FALSE) ? "host" : "client",
@@ -1580,6 +1712,9 @@ void syNetPeerUpdate(void)
 		sSYNetPeerBattleStartRepeatFrames--;
 	}
 	syNetPeerSendLocalInput();
+#if defined(PORT) && !defined(_WIN32)
+	syNetPeerUpdatePing();
+#endif
 	syNetPeerLogStats();
 }
 
@@ -1698,6 +1833,9 @@ void syNetPeerStopVSSession(void)
 	{
 		port_log("SSB64 NetPeer: lockstep stalls=%u stall_ms=%u timeouts=%u sim_dropped=%u\n",
 		         sSYNetPeerStallTicks, sSYNetPeerStallUsecs / 1000, sSYNetPeerStallTimeouts, sSYNetPeerSimDropped);
+		port_log("SSB64 NetPeer: rtt histogram <20ms=%u <50ms=%u <100ms=%u <150ms=%u >=150ms=%u max=%ums\n",
+		         sSYNetPeerRttHistogram[0], sSYNetPeerRttHistogram[1], sSYNetPeerRttHistogram[2],
+		         sSYNetPeerRttHistogram[3], sSYNetPeerRttHistogram[4], sSYNetPeerRttMaxUsecs / 1000);
 		port_log("SSB64 NetPeer: VS session stop sent=%u recv=%u dropped=%u staged=%u late=%u checksum=0x%08X\n",
 		         sSYNetPeerPacketsSent, sSYNetPeerPacketsReceived, sSYNetPeerPacketsDropped,
 		         sSYNetPeerFramesStaged, sSYNetPeerLateFrames, sSYNetPeerInputChecksum);
