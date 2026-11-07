@@ -857,9 +857,10 @@ void syNetPeerInitDebugEnv(void)
 	}
 	// SSB64_NETPLAY_BOT=1 drives the local player with scripted input so a
 	// pair can be sync-tested in real gameplay without anyone at the keys.
+	// SSB64_NETPLAY_BOT=2 just walks right, off the stage, every stock.
 	if ((getenv("SSB64_NETPLAY_BOT") != NULL) && (atoi(getenv("SSB64_NETPLAY_BOT")) != 0))
 	{
-		sSYNetPeerDebugBotIsEnabled = TRUE;
+		sSYNetPeerDebugBotIsEnabled = atoi(getenv("SSB64_NETPLAY_BOT"));
 	}
 	// SSB64_NETPLAY_LOCKSTEP=0 restores the old behavior of predicting late
 	// remote input (which desyncs, as nothing ever corrects the guess).
@@ -1559,6 +1560,13 @@ sb32 syNetPeerGetDebugBotInput(s32 player, u32 tick, u16 *buttons, s8 *stick_x, 
 		(player != sSYNetPeerLocalPlayer))
 	{
 		return FALSE;
+	}
+	if (sSYNetPeerDebugBotIsEnabled == 2)
+	{
+		*stick_x = 80;
+		*stick_y = 0;
+		*buttons = 0;
+		return TRUE;
 	}
 	h = ((tick / 12) + 1) * 2654435761U;
 	h ^= (u32)(player + 1) * 0x9E3779B9U;
