@@ -93,6 +93,16 @@ u32 sSYNetPeerLateFrames;
 u32 sSYNetPeerInputChecksum;
 sb32 sSYNetPeerDebugBotIsEnabled;
 sb32 sSYNetPeerLockstepIsEnabled;
+// Rollback mode: remote input is predicted and corrected by port/rollback;
+// the game only waits when the peer falls more than the window behind.
+sb32 sSYNetPeerRollbackIsEnabled;
+u32 sSYNetPeerRollbackWindow;
+// Fighter hash after each simulated tick (resimulations overwrite), so
+// NetSync checkpoints can be logged once their inputs are all confirmed.
+#define SYNETPEER_TICK_HASH_RING 256
+u32 sSYNetPeerTickHash[SYNETPEER_TICK_HASH_RING];
+u32 sSYNetPeerTickHashTick[SYNETPEER_TICK_HASH_RING];
+u32 sSYNetPeerNextCheckpointTick;
 u32 sSYNetPeerStallTicks;
 u32 sSYNetPeerStallUsecs;
 u32 sSYNetPeerStallTimeouts;
@@ -938,6 +948,19 @@ void syNetPeerInitDebugEnv(void)
 	{
 		sSYNetPeerDebugBotIsEnabled = atoi(getenv("SSB64_NETPLAY_BOT"));
 	}
+	// SSB64_NETPLAY_ROLLBACK=1 predicts remote input and rolls back on a
+	// misprediction (port/rollback) instead of waiting for it every tick;
+	// SSB64_NETPLAY_ROLLBACK_WINDOW caps how far ahead of the peer we run.
+	sSYNetPeerRollbackIsEnabled = FALSE;
+	sSYNetPeerRollbackWindow = 8;
+	if ((getenv("SSB64_NETPLAY_ROLLBACK") != NULL) && (atoi(getenv("SSB64_NETPLAY_ROLLBACK")) != 0))
+	{
+		sSYNetPeerRollbackIsEnabled = TRUE;
+	}
+	if (getenv("SSB64_NETPLAY_ROLLBACK_WINDOW") != NULL)
+	{
+		sSYNetPeerRollbackWindow = (u32)atoi(getenv("SSB64_NETPLAY_ROLLBACK_WINDOW"));
+	}
 	// SSB64_NETPLAY_LOCKSTEP=0 restores the old behavior of predicting late
 	// remote input (which desyncs, as nothing ever corrects the guess).
 	if ((getenv("SSB64_NETPLAY_LOCKSTEP") != NULL) && (atoi(getenv("SSB64_NETPLAY_LOCKSTEP")) == 0))
@@ -987,6 +1010,9 @@ void syNetPeerInitDebugEnv(void)
 
 void syNetPeerStartVSSession(void)
 {
+	sSYNetPeerNextCheckpointTick = 0;
+	memset(sSYNetPeerTickHashTick, 0xFF, sizeof(sSYNetPeerTickHashTick));
+
 #if defined(PORT) && !defined(_WIN32)
 	if ((sSYNetPeerIsEnabled == FALSE) || (sSYNetPeerIsConfigured == FALSE))
 	{
@@ -1494,11 +1520,17 @@ void syNetPeerReceiveRemoteInput(void)
 }
 
 #ifdef PORT
+void syNetPeerLogNetSyncValidationWithHash(u32 tick, u32 fighter_hash);
+
 void syNetPeerLogNetSyncValidation(u32 tick)
+{
+	syNetPeerLogNetSyncValidationWithHash(tick, syNetSyncHashBattleFighters());
+}
+
+void syNetPeerLogNetSyncValidationWithHash(u32 tick, u32 fighter_hash)
 {
 	u32 checksums[MAXCONTROLLERS];
 	u32 inp_all = 0;
-	u32 fighter_hash;
 	u32 win_begin = 0;
 	u32 win_length = tick;
 
@@ -1512,8 +1544,6 @@ void syNetPeerLogNetSyncValidation(u32 tick)
 		win_length = SYNETPEER_VALIDATION_INPUT_WINDOW;
 	}
 	syNetInputGetHistoryInputValueChecksumWindow(win_begin, win_length, checksums, &inp_all);
-
-	fighter_hash = syNetSyncHashBattleFighters();
 
 	port_log(
 		"SSB64 NetSync: role=%s lp=%d rp=%d tick=%u hist_win=[%u,%u) all=0x%08X p0=0x%08X p1=0x%08X p2=0x%08X p3=0x%08X figh=0x%08X snd_next=%u rcv_hw=%u gap=%u dup=%u ooo=%u puck=%u pko=%u pkn=%u sent=%u recv=%u dropped=%u stg=%u hr=%u late=%u inpchk=0x%08X pkt_valid=%d\n",
@@ -1573,7 +1603,37 @@ void syNetPeerLogStats(void)
 	         sSYNetPeerLastPeerAckTick,
 	         sSYNetPeerInputChecksum, sSYNetPeerStallTicks, sSYNetPeerStallUsecs / 1000);
 
-	syNetPeerLogNetSyncValidation(tick);
+	if (sSYNetPeerRollbackIsEnabled == FALSE)
+	{
+		syNetPeerLogNetSyncValidation(tick);
+	}
+#endif
+}
+
+// Rollback mode: a checkpoint is logged once every input before it is
+// confirmed, from the hash recorded when that tick was (re)simulated.
+void syNetPeerLogConfirmedCheckpoints(void)
+{
+#if defined(PORT) && !defined(_WIN32)
+	u32 tick = syNetInputGetTick();
+	u32 slot;
+
+	if (sSYNetPeerNextCheckpointTick == 0)
+	{
+		sSYNetPeerNextCheckpointTick = SYNETPEER_LOG_INTERVAL;
+	}
+	while ((sSYNetPeerNextCheckpointTick <= tick) && (sSYNetPeerHighestRemoteTick + 1 >= sSYNetPeerNextCheckpointTick) &&
+	       (syNetInputCheckRollbackPendingBefore(sSYNetPeerNextCheckpointTick) == FALSE))
+	{
+		slot = sSYNetPeerNextCheckpointTick % SYNETPEER_TICK_HASH_RING;
+
+		if (sSYNetPeerTickHashTick[slot] != sSYNetPeerNextCheckpointTick)
+		{
+			break; // this frame's hash is recorded after the frame; try next frame
+		}
+		syNetPeerLogNetSyncValidationWithHash(sSYNetPeerNextCheckpointTick, sSYNetPeerTickHash[slot]);
+		sSYNetPeerNextCheckpointTick += SYNETPEER_LOG_INTERVAL;
+	}
 #endif
 }
 
@@ -1717,6 +1777,11 @@ void syNetPeerUpdate(void)
 	syNetPeerUpdatePing();
 #endif
 	syNetPeerLogStats();
+
+	if (sSYNetPeerRollbackIsEnabled != FALSE)
+	{
+		syNetPeerLogConfirmedCheckpoints();
+	}
 }
 
 // Online, the one local player is driven by this machine's first controller,
@@ -1786,6 +1851,34 @@ sb32 syNetPeerGetDebugBotInput(s32 player, u32 tick, u16 *buttons, s8 *stick_x, 
 // so remote input is never guessed. Each side has already sent its input
 // delay ticks ahead, so with delay >= 1 the two can never wait on each
 // other. While waiting, resend our latest packet in case it was lost.
+// Lockstep needs the peer's input for this tick; rollback only needs it
+// within the window (older ticks are predicted and corrected later).
+sb32 syNetPeerCheckRemoteInputReady(u32 tick)
+{
+	if (sSYNetPeerRollbackIsEnabled != FALSE)
+	{
+		return ((tick < sSYNetPeerRollbackWindow) || (sSYNetPeerHighestRemoteTick + sSYNetPeerRollbackWindow >= tick))
+		           ? TRUE
+		           : FALSE;
+	}
+	return syNetInputCheckRemoteFrame(sSYNetPeerRemotePlayer, tick);
+}
+
+sb32 syNetPeerCheckRollbackEnabled(void)
+{
+	return ((sSYNetPeerIsActive != FALSE) && (sSYNetPeerRollbackIsEnabled != FALSE)) ? TRUE : FALSE;
+}
+
+// Called by port/rollback after every simulated battle tick, resimulated
+// ones included.
+void syNetPeerRecordTickHash(void)
+{
+	u32 tick = syNetInputGetTick();
+
+	sSYNetPeerTickHash[tick % SYNETPEER_TICK_HASH_RING] = syNetSyncHashBattleFighters();
+	sSYNetPeerTickHashTick[tick % SYNETPEER_TICK_HASH_RING] = tick;
+}
+
 void syNetPeerWaitForRemoteInput(u32 tick)
 {
 #if defined(PORT) && !defined(_WIN32)
@@ -1798,13 +1891,13 @@ void syNetPeerWaitForRemoteInput(u32 tick)
 	}
 	syNetPeerReceiveRemoteInput();
 
-	if (syNetInputCheckRemoteFrame(sSYNetPeerRemotePlayer, tick) != FALSE)
+	if (syNetPeerCheckRemoteInputReady(tick) != FALSE)
 	{
 		return;
 	}
 	sSYNetPeerStallTicks++;
 
-	while (syNetInputCheckRemoteFrame(sSYNetPeerRemotePlayer, tick) == FALSE)
+	while (syNetPeerCheckRemoteInputReady(tick) == FALSE)
 	{
 		if (waited_usecs >= SYNETPEER_LOCKSTEP_TIMEOUT_USECS)
 		{

@@ -29,6 +29,12 @@ SSB64_SNAPSHOT_OUTSIDE SYNetInputFrame sSYNetInputSavedHistory[MAXCONTROLLERS][S
  * the peer applies it. Packets send these future-tagged samples. */
 SSB64_SNAPSHOT_OUTSIDE SYNetInputFrame sSYNetInputLocalDelayHistory[MAXCONTROLLERS][SYNETINPUT_HISTORY_LENGTH];
 u32 sSYNetInputLocalDelay;
+/* Rollback request: the earliest already-simulated tick whose remote input
+ * turned out to differ from the prediction it ran with. Outside the snapshot
+ * so restoring a snapshot cannot erase it. */
+SSB64_SNAPSHOT_OUTSIDE sb32 sSYNetInputRollbackPending;
+SSB64_SNAPSHOT_OUTSIDE u32 sSYNetInputRollbackTick;
+
 /* Hardware controller state for this tick, saved before published frames
  * overwrite gSYControllerDevices[]. */
 SYController sSYNetInputPhysicalDevices[MAXCONTROLLERS];
@@ -121,6 +127,7 @@ void syNetInputReset(void)
 
 	sSYNetInputTick = 0;
 	sSYNetInputLocalDelay = 0;
+	sSYNetInputRollbackPending = FALSE;
 	sSYNetInputRecordedFrameCount = 0;
 	sSYNetInputIsRecording = FALSE;
 	sSYNetInputIsReplayMetadataValid = FALSE;
@@ -201,12 +208,41 @@ SYNetInputSource syNetInputGetSlotSource(s32 player)
 void syNetInputSetRemoteInput(s32 player, u32 tick, u16 buttons, s8 stick_x, s8 stick_y)
 {
 	SYNetInputFrame frame;
+	SYNetInputFrame used;
 
 	if (syNetInputCheckPlayer(player) != FALSE)
 	{
 		syNetInputMakeFrame(&frame, tick, buttons, stick_x, stick_y, nSYNetInputSourceRemoteConfirmed, FALSE);
 		syNetInputStoreFrame(sSYNetInputRemoteHistory, player, &frame);
+
+		// Already simulated on a wrong guess: that tick must be resimulated.
+		if ((tick < sSYNetInputTick) && (syNetInputGetStoredFrame(sSYNetInputHistory, player, tick, &used) != FALSE) &&
+			(used.is_predicted != FALSE) &&
+			((used.buttons != buttons) || (used.stick_x != stick_x) || (used.stick_y != stick_y)))
+		{
+			if ((sSYNetInputRollbackPending == FALSE) || (tick < sSYNetInputRollbackTick))
+			{
+				sSYNetInputRollbackTick = tick;
+			}
+			sSYNetInputRollbackPending = TRUE;
+		}
 	}
+}
+
+sb32 syNetInputCheckRollbackPendingBefore(u32 tick)
+{
+	return ((sSYNetInputRollbackPending != FALSE) && (sSYNetInputRollbackTick < tick)) ? TRUE : FALSE;
+}
+
+sb32 syNetInputTakeRollbackTick(u32 *out_tick)
+{
+	if (sSYNetInputRollbackPending == FALSE)
+	{
+		return FALSE;
+	}
+	*out_tick = sSYNetInputRollbackTick;
+	sSYNetInputRollbackPending = FALSE;
+	return TRUE;
 }
 
 void syNetInputSetSavedInput(s32 player, u32 tick, u16 buttons, s8 stick_x, s8 stick_y)

@@ -93,5 +93,7 @@ extern sb32 syNetInputGetDelayedLocalFrame(s32 player, u32 tick, SYNetInputFrame
 extern sb32 syNetInputCheckRemoteFrame(s32 player, u32 tick);
 extern void syNetInputFuncRead(void);
 extern sb32 syNetInputCheckResimulating(void);
+extern sb32 syNetInputTakeRollbackTick(u32 *out_tick);
+extern sb32 syNetInputCheckRollbackPendingBefore(u32 tick);
 
 #endif /* _SYNETINPUT_H_ */
