@@ -153,7 +153,12 @@ SYAudioSettings dSYAudioPublicSettings =
 // PORT: Larger heap — N64 heap was sized for 4MB RDRAM.  On PC we need
 // space for parsed bank structs, sequence data copies, FGM packages,
 // Acmd double buffers, and audio output triple buffers.
-u8 gSYAudioHeapBuffer[0x100000]; // 1 MB
+// Rollback snapshots copy only its allocated part (sSYAudioHeap.base..cur),
+// so the buffer itself stays outside the snapshot section.
+#ifndef SSB64_SNAPSHOT_OUTSIDE
+#define SSB64_SNAPSHOT_OUTSIDE
+#endif
+SSB64_SNAPSHOT_OUTSIDE u8 gSYAudioHeapBuffer[0x100000]; // 1 MB
 #elif defined(REGION_US)
 u8 gSYAudioHeapBuffer[0x56000];
 #else
