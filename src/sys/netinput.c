@@ -13,19 +13,26 @@ typedef struct SYNetInputSlot
 
 } SYNetInputSlot;
 
+/* Rollback: the input ledgers (who pressed what on which tick) must survive
+ * a state restore, so they stay outside the snapshot; per-tick simulation
+ * state (slots, tick, published checksums) is snapshotted with the game. */
+#ifndef SSB64_SNAPSHOT_OUTSIDE
+#define SSB64_SNAPSHOT_OUTSIDE
+#endif
+
 SYNetInputSlot sSYNetInputSlots[MAXCONTROLLERS];
-SYNetInputFrame sSYNetInputHistory[MAXCONTROLLERS][SYNETINPUT_HISTORY_LENGTH];
-SYNetInputFrame sSYNetInputRemoteHistory[MAXCONTROLLERS][SYNETINPUT_HISTORY_LENGTH];
-SYNetInputFrame sSYNetInputSavedHistory[MAXCONTROLLERS][SYNETINPUT_HISTORY_LENGTH];
+SSB64_SNAPSHOT_OUTSIDE SYNetInputFrame sSYNetInputHistory[MAXCONTROLLERS][SYNETINPUT_HISTORY_LENGTH];
+SSB64_SNAPSHOT_OUTSIDE SYNetInputFrame sSYNetInputRemoteHistory[MAXCONTROLLERS][SYNETINPUT_HISTORY_LENGTH];
+SSB64_SNAPSHOT_OUTSIDE SYNetInputFrame sSYNetInputSavedHistory[MAXCONTROLLERS][SYNETINPUT_HISTORY_LENGTH];
 /* Delay-based netplay: local input sampled at tick t is stored here tagged
  * t + sSYNetInputLocalDelay and only published at that tick, the same tick
  * the peer applies it. Packets send these future-tagged samples. */
-SYNetInputFrame sSYNetInputLocalDelayHistory[MAXCONTROLLERS][SYNETINPUT_HISTORY_LENGTH];
+SSB64_SNAPSHOT_OUTSIDE SYNetInputFrame sSYNetInputLocalDelayHistory[MAXCONTROLLERS][SYNETINPUT_HISTORY_LENGTH];
 u32 sSYNetInputLocalDelay;
 /* Hardware controller state for this tick, saved before published frames
  * overwrite gSYControllerDevices[]. */
 SYController sSYNetInputPhysicalDevices[MAXCONTROLLERS];
-SYNetInputFrame sSYNetInputReplayFrames[MAXCONTROLLERS][SYNETINPUT_REPLAY_MAX_FRAMES];
+SSB64_SNAPSHOT_OUTSIDE SYNetInputFrame sSYNetInputReplayFrames[MAXCONTROLLERS][SYNETINPUT_REPLAY_MAX_FRAMES];
 SYNetInputReplayMetadata sSYNetInputReplayMetadata;
 u32 sSYNetInputTick;
 u32 sSYNetInputRecordedFrameCount;
@@ -213,6 +220,18 @@ void syNetInputSetSavedInput(s32 player, u32 tick, u16 buttons, s8 stick_x, s8 s
 	}
 }
 
+/* Rollback resimulation in progress (port/rollback/rollback.h). */
+sb32 syNetInputCheckResimulating(void)
+{
+#if defined(PORT) && defined(__APPLE__)
+	extern int gPortRollbackResim;
+
+	return (gPortRollbackResim != 0) ? TRUE : FALSE;
+#else
+	return FALSE;
+#endif
+}
+
 /* Netplay diagnostics: every 120 local samples, log how far the local
  * player's stick travelled in each direction (N64 full tilt is about 80). */
 void syNetInputLogLocalStickRange(SYNetInputFrame *frame)
@@ -298,8 +317,9 @@ void syNetInputResolveDelayedLocalFrame(s32 player, u32 tick, SYNetInputFrame *o
 	SYNetInputFrame sample;
 
 	/* Sample only on ticks that will actually advance, so the frames held at
-	 * tick 0 behind the start barrier don't rewrite an already-sent sample. */
-	if (syNetPeerCheckStartBarrierReleased() != FALSE)
+	 * tick 0 behind the start barrier don't rewrite an already-sent sample.
+	 * A rollback resimulation replays the ledger: never sample then. */
+	if ((syNetPeerCheckStartBarrierReleased() != FALSE) && (syNetInputCheckResimulating() == FALSE))
 	{
 		syNetInputMakeLocalFrame(player, tick, &sample);
 		sample.tick = tick + sSYNetInputLocalDelay;

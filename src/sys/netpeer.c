@@ -1696,7 +1696,8 @@ void syNetPeerUpdateBattleGate(void)
 
 void syNetPeerUpdate(void)
 {
-	if (sSYNetPeerIsActive == FALSE)
+	// A rollback resimulation replays ticks already sent and logged.
+	if ((sSYNetPeerIsActive == FALSE) || (syNetInputCheckResimulating() != FALSE))
 	{
 		return;
 	}
@@ -1791,7 +1792,7 @@ void syNetPeerWaitForRemoteInput(u32 tick)
 	u32 waited_usecs = 0;
 
 	if ((sSYNetPeerIsActive == FALSE) || (sSYNetPeerLockstepIsEnabled == FALSE) ||
-		(sSYNetPeerInputDelay == 0))
+		(sSYNetPeerInputDelay == 0) || (syNetInputCheckResimulating() != FALSE))
 	{
 		return;
 	}
