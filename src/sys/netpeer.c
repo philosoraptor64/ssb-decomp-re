@@ -21,6 +21,7 @@ extern void port_watchdog_note_yield(void);
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <string.h>
+#include <ctype.h>
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
@@ -441,6 +442,51 @@ sb32 syNetPeerOpenSocket(void)
 }
 #endif
 
+// Fighter for a player from SSB64_NETPLAY_P<n>_FIGHTER (a name such as
+// "kirby", or the FTKind number). The host's choice travels in the match
+// config, so only the host's setting matters.
+sb32 syNetPeerMatchesName(const char *value, const char *name)
+{
+	while ((*value != '\0') && (*name != '\0'))
+	{
+		if (tolower((unsigned char)*value) != *name)
+		{
+			return FALSE;
+		}
+		value++, name++;
+	}
+	return ((*value == '\0') && (*name == '\0')) ? TRUE : FALSE;
+}
+
+s32 syNetPeerGetBootstrapFighter(s32 player, s32 fallback)
+{
+	static const char *names[] = { "mario", "fox", "donkey", "samus", "luigi", "link",
+	                               "yoshi", "captain", "kirby", "pikachu", "purin", "ness" };
+	char key[] = "SSB64_NETPLAY_Pn_FIGHTER";
+	const char *value;
+	s32 i;
+
+	key[sizeof("SSB64_NETPLAY_P") - 1] = (char)('1' + player);
+	value = getenv(key);
+
+	if (value == NULL)
+	{
+		return fallback;
+	}
+	for (i = 0; i < (s32)ARRAY_COUNT(names); i++)
+	{
+		if (syNetPeerMatchesName(value, names[i]) != FALSE)
+		{
+			return nFTKindPlayableStart + i;
+		}
+	}
+	if ((atoi(value) >= nFTKindPlayableStart) && (atoi(value) <= nFTKindPlayableEnd))
+	{
+		return atoi(value);
+	}
+	return fallback;
+}
+
 void syNetPeerMakeBootstrapMetadata(SYNetInputReplayMetadata *metadata)
 {
 	s32 player;
@@ -477,9 +523,9 @@ void syNetPeerMakeBootstrapMetadata(SYNetInputReplayMetadata *metadata)
 		metadata->shades[player] = 0;
 	}
 	metadata->player_kinds[0] = nFTPlayerKindMan;
-	metadata->fighter_kinds[0] = nFTKindMario;
+	metadata->fighter_kinds[0] = syNetPeerGetBootstrapFighter(0, nFTKindMario);
 	metadata->player_kinds[1] = nFTPlayerKindMan;
-	metadata->fighter_kinds[1] = nFTKindFox;
+	metadata->fighter_kinds[1] = syNetPeerGetBootstrapFighter(1, nFTKindFox);
 }
 
 void syNetPeerApplyBootstrapMetadata(const SYNetInputReplayMetadata *metadata)
@@ -857,7 +903,8 @@ void syNetPeerInitDebugEnv(void)
 	}
 	// SSB64_NETPLAY_BOT=1 drives the local player with scripted input so a
 	// pair can be sync-tested in real gameplay without anyone at the keys.
-	// SSB64_NETPLAY_BOT=2 just walks right, off the stage, every stock.
+	// SSB64_NETPLAY_BOT=2 just walks right, off the stage, every stock;
+	// SSB64_NETPLAY_BOT=3 stands still (a punching bag for long tests).
 	if ((getenv("SSB64_NETPLAY_BOT") != NULL) && (atoi(getenv("SSB64_NETPLAY_BOT")) != 0))
 	{
 		sSYNetPeerDebugBotIsEnabled = atoi(getenv("SSB64_NETPLAY_BOT"));
@@ -1560,6 +1607,13 @@ sb32 syNetPeerGetDebugBotInput(s32 player, u32 tick, u16 *buttons, s8 *stick_x, 
 		(player != sSYNetPeerLocalPlayer))
 	{
 		return FALSE;
+	}
+	if (sSYNetPeerDebugBotIsEnabled == 3)
+	{
+		*stick_x = 0;
+		*stick_y = 0;
+		*buttons = 0;
+		return TRUE;
 	}
 	if (sSYNetPeerDebugBotIsEnabled == 2)
 	{
