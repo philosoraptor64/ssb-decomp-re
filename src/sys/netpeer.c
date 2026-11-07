@@ -12,6 +12,7 @@
 extern char *getenv(const char *name);
 extern int atoi(const char *s);
 extern void port_log(const char *fmt, ...);
+extern void port_watchdog_note_yield(void);
 #endif
 
 #if defined(PORT) && !defined(_WIN32)
@@ -39,6 +40,10 @@ extern void port_log(const char *fmt, ...);
 #define SYNETPEER_DEFAULT_BOOTSTRAP_SEED 12345
 #define SYNETPEER_LOG_INTERVAL 120
 #define SYNETPEER_BOOTSTRAP_RETRY_COUNT 300
+// Waiting for the other instance to boot can take far longer than the
+// handshake itself (two processes launched together reach this point up to
+// ~15s apart on macOS), so the first wait gets its own ~60s budget.
+#define SYNETPEER_BOOTSTRAP_PEER_WAIT_COUNT 3600
 #define SYNETPEER_BOOTSTRAP_RETRY_USECS 16666
 #define SYNETPEER_BARRIER_LOG_INTERVAL 30
 #define SYNETPEER_BATTLE_START_REPEAT_FRAMES 30
@@ -293,6 +298,10 @@ sb32 syNetPeerCheckMetadata(const SYNetInputReplayMetadata *metadata)
 void syNetPeerSleepBootstrapRetry(void)
 {
 	usleep(SYNETPEER_BOOTSTRAP_RETRY_USECS);
+
+	// Bootstrap blocks the game coroutine; tell the port watchdog we are
+	// alive so it does not treat the wait as a hang (>3s) and kill us.
+	port_watchdog_note_yield();
 }
 
 const char *syNetPeerFindPortSeparator(const char *text)
@@ -665,7 +674,7 @@ void syNetPeerRunBootstrap(void)
 		syNetPeerMakeBootstrapMetadata(&sSYNetPeerBootstrapMetadata);
 		syNetPeerApplyBootstrapMetadata(&sSYNetPeerBootstrapMetadata);
 
-		for (i = 0; i < SYNETPEER_BOOTSTRAP_RETRY_COUNT; i++)
+		for (i = 0; i < SYNETPEER_BOOTSTRAP_PEER_WAIT_COUNT; i++)
 		{
 			syNetPeerSendMatchConfigPacket();
 			syNetPeerReceiveBootstrapPackets();
@@ -691,7 +700,7 @@ void syNetPeerRunBootstrap(void)
 	}
 	else
 	{
-		for (i = 0; i < SYNETPEER_BOOTSTRAP_RETRY_COUNT; i++)
+		for (i = 0; i < SYNETPEER_BOOTSTRAP_PEER_WAIT_COUNT; i++)
 		{
 			syNetPeerReceiveBootstrapPackets();
 
