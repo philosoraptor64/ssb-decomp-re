@@ -1079,6 +1079,9 @@ void scManagerRunLoop(sb32 arg)
 		 * dereferences a freed slot before the next stage init repopulates
 		 * the union from scratch. */
 		memset(&gGRCommonStruct, 0, sizeof(gGRCommonStruct));
+		/* Host-set-up online matches: after the results the joiner goes
+		 * back to waiting for the host's next match, not to the menus. */
+		gSCManagerSceneData.scene_curr = syNetPeerLobbyGetNextScene(gSCManagerSceneData.scene_curr);
 #endif
 		switch (gSCManagerSceneData.scene_curr)
 		{

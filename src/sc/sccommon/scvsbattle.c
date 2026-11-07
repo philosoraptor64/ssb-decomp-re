@@ -656,6 +656,14 @@ void scVSBattleFuncLights(Gfx **dls)
 // 0x8018E190
 void scVSBattleStartScene(void)
 {
+#ifdef PORT
+	// Host-set-up online matches: connect and exchange the match settings
+	// before the battle reads them (sys/netpeer.c).
+	if (syNetPeerLobbyBeginMatch() != FALSE)
+	{
+		return;
+	}
+#endif
 	gSCManagerBattleState = &gSCManagerTransferBattleState;
 	gSCManagerBattleState->game_type = nSCBattleGameTypeRoyal;
 	gSCManagerBattleState->gkind = gSCManagerSceneData.gkind;
@@ -684,7 +692,12 @@ void scVSBattleStartScene(void)
 	func_800266A0_272A0();
 	gmRumbleInitPlayers();
 
+#ifdef PORT
+	// No sudden death online yet: it runs without a netplay session.
+	if (!(gSCManagerSceneData.is_reset) && (syNetPeerLobbyCheckMatchOnline() == FALSE) && scVSBattleSetScoreCheckSuddenDeath() != FALSE)
+#else
 	if (!(gSCManagerSceneData.is_reset) && scVSBattleSetScoreCheckSuddenDeath() != FALSE)
+#endif
 	{
 		gSCManagerBattleState = &gSCManagerVSBattleState;
 

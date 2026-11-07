@@ -19,5 +19,9 @@ extern void syNetPeerRecordTickHash(void);
 extern sb32 syNetPeerTakeTimeSyncSkip(void);
 extern s32 syNetPeerGetControllerPort(s32 player);
 extern sb32 syNetPeerGetDebugBotInput(s32 player, u32 tick, u16 *buttons, s8 *stick_x, s8 *stick_y);
+// Host-set-up online matches (SSB64_NETPLAY_LOBBY=1).
+extern sb32 syNetPeerLobbyBeginMatch(void);
+extern sb32 syNetPeerLobbyCheckMatchOnline(void);
+extern s32 syNetPeerLobbyGetNextScene(s32 scene);
 
 #endif /* _SYNETPEER_H_ */

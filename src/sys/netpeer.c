@@ -18,6 +18,12 @@ struct sockaddr_in;
 // port/net: find the peer through the n64net rendezvous server
 // (SSB64_NETPLAY_SERVER / SSB64_NETPLAY_ROOM). Returns 0 on success.
 extern int port_netplay_rendezvous(int sock, int is_host, struct sockaddr_in *out_peer);
+// port/net: one step of a start-up wait that keeps the app responsive, and
+// the "connecting" status shown meanwhile (NULL title hides it).
+extern void port_netplay_boot_wait(void);
+extern void port_netplay_status(const char *title, const char *text);
+extern void port_netplay_alert(const char *text);
+extern void port_netplay_rendezvous_bye(int sock);
 #endif
 #endif
 
@@ -153,6 +159,12 @@ sb32 sSYNetPeerExecutionBeginLogged;
 
 #if defined(PORT) && !defined(_WIN32)
 sb32 sSYNetPeerUseRendezvous;
+// Host-set-up matches (SSB64_NETPLAY_LOBBY=1): the host picks fighters, CPUs,
+// teams, rules and stage in the normal VS menus; when the battle would start
+// the room opens and the joiner plays player 2. One connection per match.
+sb32 sSYNetPeerLobbyIsEnabled;
+sb32 sSYNetPeerLobbyMatchOnline;  // this match is being played online
+sb32 sSYNetPeerLobbyHasMetadata;  // host: config captured from the menus
 s32 sSYNetPeerSocket = -1;
 struct sockaddr_in sSYNetPeerBindAddress;
 struct sockaddr_in sSYNetPeerPeerAddress;
@@ -342,11 +354,10 @@ sb32 syNetPeerCheckMetadata(const SYNetInputReplayMetadata *metadata)
 #if defined(PORT) && !defined(_WIN32)
 void syNetPeerSleepBootstrapRetry(void)
 {
-	usleep(SYNETPEER_BOOTSTRAP_RETRY_USECS);
-
-	// Bootstrap blocks the game coroutine; tell the port watchdog we are
-	// alive so it does not treat the wait as a hang (>3s) and kill us.
-	port_watchdog_note_yield();
+	// Hands the frame back to the main loop (~16 ms per step) instead of
+	// blocking it, so the OS keeps getting answers while we wait for the
+	// peer (iOS kills apps that stop responding); also pets the watchdog.
+	port_netplay_boot_wait();
 }
 
 const char *syNetPeerFindPortSeparator(const char *text)
@@ -786,7 +797,15 @@ void syNetPeerReceiveBootstrapPackets(void)
 	}
 }
 
+void syNetPeerRunBootstrapSteps(void);
+
 void syNetPeerRunBootstrap(void)
+{
+	syNetPeerRunBootstrapSteps();
+	port_netplay_status(NULL, NULL);  // connected, failed or timed out: hide "connecting"
+}
+
+void syNetPeerRunBootstrapSteps(void)
 {
 	s32 i;
 
@@ -809,7 +828,10 @@ void syNetPeerRunBootstrap(void)
 
 	if (sSYNetPeerBootstrapIsHost != FALSE)
 	{
-		syNetPeerMakeBootstrapMetadata(&sSYNetPeerBootstrapMetadata);
+		if (sSYNetPeerLobbyHasMetadata == FALSE)
+		{
+			syNetPeerMakeBootstrapMetadata(&sSYNetPeerBootstrapMetadata);
+		}
 		syNetPeerApplyBootstrapMetadata(&sSYNetPeerBootstrapMetadata);
 
 		for (i = 0; i < SYNETPEER_BOOTSTRAP_PEER_WAIT_COUNT; i++)
@@ -874,6 +896,140 @@ void syNetPeerRunBootstrap(void)
 		         sSYNetPeerBootstrapMetadata.stage_kind, sSYNetPeerBootstrapMetadata.rng_seed);
 	}
 }
+#endif
+
+#if defined(PORT) && !defined(_WIN32)
+// Called at the start of every VS battle scene (scVSBattleStartScene), before
+// the battle reads gSCManagerTransferBattleState. Returns TRUE if the scene
+// should be abandoned (the joiner gave up waiting; it goes to the title).
+sb32 syNetPeerLobbyBeginMatch(void)
+{
+	SCBattleState menu_state = gSCManagerTransferBattleState;  // the host's choices, for an offline fallback
+
+	sSYNetPeerLobbyMatchOnline = FALSE;
+	sSYNetPeerLobbyHasMetadata = FALSE;
+
+	if (sSYNetPeerLobbyIsEnabled == FALSE)
+	{
+		return FALSE;
+	}
+	sSYNetPeerIsEnabled = TRUE;
+	sSYNetPeerIsActive = FALSE;
+	sSYNetPeerBootstrapIsEnabled = TRUE;
+	sSYNetPeerBootstrapMetadataApplied = FALSE;
+	sSYNetPeerBootstrapPeerReady = FALSE;
+	sSYNetPeerBootstrapStartReceived = FALSE;
+
+	if (sSYNetPeerBootstrapIsHost != FALSE)
+	{
+		SCBattleState *state = &gSCManagerTransferBattleState;
+
+		// SSB64_NETPLAY_LOBBY_TEST=1 stands in for the menus in unattended
+		// tests: 2v2 teams, host + CPU Kirby vs joiner (Fox) + CPU Pikachu.
+		if ((getenv("SSB64_NETPLAY_LOBBY_TEST") != NULL) && (atoi(getenv("SSB64_NETPLAY_LOBBY_TEST")) != 0))
+		{
+			static const s32 fkinds[4] = { nFTKindMario, nFTKindFox, nFTKindKirby, nFTKindPikachu };
+			s32 p;
+
+			*state = dSCManagerDefaultBattleState;
+			state->game_type = nSCBattleGameTypeRoyal;
+			state->game_rules = SCBATTLE_GAMERULE_STOCK;
+			state->stocks = 1;
+			state->is_team_battle = TRUE;
+			state->is_team_attack = FALSE;
+			state->time_limit = SCBATTLE_TIMELIMIT_INFINITE;
+			state->pl_count = 1;
+			state->cp_count = 3;
+			gSCManagerSceneData.gkind = nGRKindCastle;
+
+			for (p = 0; p < 4; p++)
+			{
+				state->players[p].pkind = (p == 0) ? nFTPlayerKindMan : nFTPlayerKindCom;
+				state->players[p].fkind = fkinds[p];
+				state->players[p].costume = 0;
+				state->players[p].shade = 0;
+				state->players[p].team = p % 2;
+				state->players[p].handicap = 9;
+				state->players[p].level = 3;
+			}
+		}
+
+		// Player 2 is the online opponent: in the menus the host sets it to
+		// CPU (any level) to pick its fighter; it becomes human here.
+		if (state->players[1].pkind == nFTPlayerKindNot)
+		{
+			port_netplay_alert("To play online, set Player 2 to CPU (any level) on the character select "
+			                   "screen: that slot becomes your online opponent. Playing this match offline.");
+			sSYNetPeerIsEnabled = FALSE;
+			return FALSE;
+		}
+		state->gkind = gSCManagerSceneData.gkind;
+		menu_state = *state;
+		syNetReplayCaptureBattleMetadata(state, &sSYNetPeerBootstrapMetadata);
+		sSYNetPeerBootstrapMetadata.player_kinds[1] = nFTPlayerKindMan;
+		{
+			// A fresh seed per match (sent to the joiner, so both agree);
+			// the menus' RNG state would repeat the same match every time.
+			struct timespec ts;
+
+			clock_gettime(CLOCK_REALTIME, &ts);
+			sSYNetPeerBootstrapMetadata.rng_seed = (u32)ts.tv_sec ^ (u32)ts.tv_nsec;
+		}
+		sSYNetPeerLobbyHasMetadata = TRUE;
+	}
+	syNetPeerRunBootstrap();
+
+	if ((sSYNetPeerIsActive != FALSE) &&
+		((sSYNetPeerBootstrapIsHost != FALSE) ? (sSYNetPeerBootstrapPeerReady != FALSE) : (sSYNetPeerBootstrapStartReceived != FALSE)))
+	{
+		sSYNetPeerLobbyMatchOnline = TRUE;
+		return FALSE;
+	}
+	// Nobody joined (host), the host never started (joiner), or the
+	// handshake failed: play this match offline.
+	syNetPeerCloseSocket();
+	sSYNetPeerIsActive = FALSE;
+	sSYNetPeerIsEnabled = FALSE;
+
+	if (sSYNetPeerBootstrapIsHost == FALSE)
+	{
+		port_netplay_alert("Couldn't start an online match with the host. Open the game again to retry.");
+		gSCManagerSceneData.scene_prev = gSCManagerSceneData.scene_curr;
+		gSCManagerSceneData.scene_curr = nSCKindTitle;
+		return TRUE;
+	}
+	gSCManagerTransferBattleState = menu_state;  // player 2 back to the CPU the host picked
+	port_netplay_alert("Nobody joined the room, so this match is played offline (Player 2 is a CPU).");
+	return FALSE;
+}
+
+// TRUE while the current VS battle is an online match.
+sb32 syNetPeerLobbyCheckMatchOnline(void)
+{
+	return sSYNetPeerLobbyMatchOnline;
+}
+
+// After a host-set-up match: the joiner skips character select and waits
+// for the host's next match instead.
+s32 syNetPeerLobbyGetNextScene(s32 scene)
+{
+	if ((sSYNetPeerLobbyIsEnabled != FALSE) && (scene == nSCKindVSResults) &&
+		(getenv("SSB64_NETPLAY_LOBBY_TEST") != NULL) && (atoi(getenv("SSB64_NETPLAY_LOBBY_TEST")) != 0))
+	{
+		return nSCKindVSBattle;  // unattended tests: nobody presses a button on the results screen
+	}
+	if ((sSYNetPeerLobbyIsEnabled != FALSE) && (scene == nSCKindPlayersVS) &&
+		((sSYNetPeerBootstrapIsHost == FALSE) ||
+		 ((getenv("SSB64_NETPLAY_LOBBY_TEST") != NULL) && (atoi(getenv("SSB64_NETPLAY_LOBBY_TEST")) != 0))))
+	{
+		return nSCKindVSBattle;  // (unattended tests: the host skips its menus too)
+	}
+	return scene;
+}
+#else
+sb32 syNetPeerLobbyBeginMatch(void) { return FALSE; }
+sb32 syNetPeerLobbyCheckMatchOnline(void) { return FALSE; }
+s32 syNetPeerLobbyGetNextScene(s32 scene) { return scene; }
 #endif
 
 void syNetPeerInitDebugEnv(void)
@@ -1061,6 +1217,22 @@ void syNetPeerInitDebugEnv(void)
 	         sSYNetPeerLocalPlayer, sSYNetPeerRemotePlayer, sSYNetPeerInputDelay,
 	         sSYNetPeerSessionID, sSYNetPeerBootstrapIsEnabled, sSYNetPeerBootstrapIsHost,
 	         sSYNetPeerBootstrapSeed, bind_env, peer_env);
+
+	sSYNetPeerLobbyIsEnabled = (getenv("SSB64_NETPLAY_LOBBY") != NULL) && (atoi(getenv("SSB64_NETPLAY_LOBBY")) != 0) &&
+	                           (sSYNetPeerUseRendezvous != FALSE);
+	if (sSYNetPeerLobbyIsEnabled != FALSE)
+	{
+		// No connection at boot: the host goes to the VS menus to set up the
+		// match, the joiner straight to the battle scene, where
+		// syNetPeerLobbyBeginMatch() connects and waits for the host.
+		if ((sSYNetPeerBootstrapIsHost == FALSE) || (getenv("SSB64_START_SCENE") == NULL))
+		{
+			gSCManagerSceneData.scene_prev = nSCKindVSMode;
+			gSCManagerSceneData.scene_curr = (sSYNetPeerBootstrapIsHost != FALSE) ? nSCKindVSMode : nSCKindVSBattle;
+		}
+		port_log("SSB64 NetPeer: host-set-up matches (%s)\n", (sSYNetPeerBootstrapIsHost != FALSE) ? "host" : "joiner");
+		return;
+	}
 	syNetPeerRunBootstrap();
 #else
 	port_log("SSB64 NetPeer: debug UDP netplay is not implemented on Windows yet\n");
@@ -2062,7 +2234,16 @@ void syNetPeerStopVSSession(void)
 		         sSYNetPeerPacketsSent, sSYNetPeerPacketsReceived, sSYNetPeerPacketsDropped,
 		         sSYNetPeerFramesStaged, sSYNetPeerLateFrames, sSYNetPeerInputChecksum);
 	}
+	if ((sSYNetPeerLobbyIsEnabled != FALSE) && (sSYNetPeerBootstrapIsHost != FALSE) && (sSYNetPeerSocket >= 0))
+	{
+		// Close the room so the joiner waits for the next match.
+		port_netplay_rendezvous_bye(sSYNetPeerSocket);
+	}
 	syNetPeerCloseSocket();
+	if (sSYNetPeerLobbyIsEnabled != FALSE)
+	{
+		sSYNetPeerIsEnabled = TRUE;  // re-armed for the next match (an offline fallback cleared it)
+	}
 #endif
 	sSYNetPeerIsActive = FALSE;
 }
