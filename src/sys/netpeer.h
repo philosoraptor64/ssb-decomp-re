@@ -16,6 +16,7 @@ extern sb32 syNetPeerCheckLocalPlayer(s32 player);
 extern sb32 syNetPeerCheckRollbackEnabled(void);
 extern sb32 syNetPeerCheckRemoteInputReady(u32 tick);
 extern void syNetPeerRecordTickHash(void);
+extern sb32 syNetPeerTakeTimeSyncSkip(void);
 extern s32 syNetPeerGetControllerPort(s32 player);
 extern sb32 syNetPeerGetDebugBotInput(s32 player, u32 tick, u16 *buttons, s8 *stick_x, s8 *stick_y);
 

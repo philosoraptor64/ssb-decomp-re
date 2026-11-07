@@ -65,7 +65,7 @@ void syNetPeerHandleTimingPacket(const u8 *buffer, s32 size);
 #define SYNETPEER_PACKET_BATTLE_START 5
 #define SYNETPEER_PACKET_PING 6
 #define SYNETPEER_PACKET_PONG 7
-#define SYNETPEER_TIMING_PACKET_BYTES (4 + 2 + 2 + 4 + 4 + 4)
+#define SYNETPEER_TIMING_PACKET_BYTES (4 + 2 + 2 + 4 + 4 + 4 + 4)
 #define SYNETPEER_PING_INTERVAL 15 // ticks between round-trip probes
 
 typedef struct SYNetPeerPacketFrame
@@ -103,6 +103,10 @@ u32 sSYNetPeerRollbackWindow;
 u32 sSYNetPeerTickHash[SYNETPEER_TICK_HASH_RING];
 u32 sSYNetPeerTickHashTick[SYNETPEER_TICK_HASH_RING];
 u32 sSYNetPeerNextCheckpointTick;
+extern sb32 sSYNetPeerRemoteAdvantageValid; // time sync, defined with the timing packets
+extern u32 sSYNetPeerTimeSyncSkips;
+extern u32 sSYNetPeerTimeSyncCooldown;
+extern s32 sSYNetPeerTimeSyncAhead16;
 u32 sSYNetPeerStallTicks;
 u32 sSYNetPeerStallUsecs;
 u32 sSYNetPeerStallTimeouts;
@@ -1012,6 +1016,12 @@ void syNetPeerStartVSSession(void)
 {
 	sSYNetPeerNextCheckpointTick = 0;
 	memset(sSYNetPeerTickHashTick, 0xFF, sizeof(sSYNetPeerTickHashTick));
+#if defined(PORT) && !defined(_WIN32)
+	sSYNetPeerRemoteAdvantageValid = FALSE;
+	sSYNetPeerTimeSyncSkips = 0;
+	sSYNetPeerTimeSyncCooldown = 0;
+	sSYNetPeerTimeSyncAhead16 = 0;
+#endif
 
 #if defined(PORT) && !defined(_WIN32)
 	if ((sSYNetPeerIsEnabled == FALSE) || (sSYNetPeerIsConfigured == FALSE))
@@ -1264,6 +1274,16 @@ u32 sSYNetPeerRttWindowSumUsecs;
 u32 sSYNetPeerRttWindowMaxUsecs;
 u32 sSYNetPeerRttMaxUsecs;
 u32 sSYNetPeerRttHistogram[5]; // <20, <50, <100, <150, >=150 ms
+// Time sync: each side's "advantage" is its tick minus the newest remote
+// tick it has. Half the difference between ours and the peer's is how many
+// frames we run ahead of the peer; the side ahead slows down a little.
+s32 sSYNetPeerRemoteAdvantage;
+sb32 sSYNetPeerRemoteAdvantageValid;
+
+s32 syNetPeerGetLocalAdvantage(void)
+{
+	return (s32)syNetInputGetTick() - (s32)sSYNetPeerHighestRemoteTick;
+}
 
 void syNetPeerSendTimingPacket(u16 packet_type, u32 stamp)
 {
@@ -1276,6 +1296,7 @@ void syNetPeerSendTimingPacket(u16 packet_type, u32 stamp)
 	syNetPeerWriteU16(&cursor, packet_type);
 	syNetPeerWriteU32(&cursor, sSYNetPeerSessionID);
 	syNetPeerWriteU32(&cursor, stamp);
+	syNetPeerWriteU32(&cursor, (u32)syNetPeerGetLocalAdvantage());
 	checksum = syNetPeerChecksumBytes(buffer, cursor - buffer);
 	syNetPeerWriteU32(&cursor, checksum);
 	syNetPeerSimSend(buffer, SYNETPEER_TIMING_PACKET_BYTES);
@@ -1284,7 +1305,7 @@ void syNetPeerSendTimingPacket(u16 packet_type, u32 stamp)
 void syNetPeerHandleTimingPacket(const u8 *buffer, s32 size)
 {
 	const u8 *cursor = buffer;
-	u32 magic, session_id, stamp, checksum, rtt;
+	u32 magic, session_id, stamp, advantage, checksum, rtt;
 	u16 version, packet_type;
 
 	if (size != SYNETPEER_TIMING_PACKET_BYTES)
@@ -1296,6 +1317,7 @@ void syNetPeerHandleTimingPacket(const u8 *buffer, s32 size)
 	packet_type = syNetPeerReadU16(&cursor);
 	session_id = syNetPeerReadU32(&cursor);
 	stamp = syNetPeerReadU32(&cursor);
+	advantage = syNetPeerReadU32(&cursor);
 	checksum = syNetPeerReadU32(&cursor);
 
 	if ((magic != SYNETPEER_MAGIC) || (version != SYNETPEER_VERSION) || (session_id != sSYNetPeerSessionID) ||
@@ -1304,6 +1326,9 @@ void syNetPeerHandleTimingPacket(const u8 *buffer, s32 size)
 		sSYNetPeerPacketsDropped++;
 		return;
 	}
+	sSYNetPeerRemoteAdvantage = (s32)advantage;
+	sSYNetPeerRemoteAdvantageValid = TRUE;
+
 	if (packet_type == SYNETPEER_PACKET_PING)
 	{
 		syNetPeerSendTimingPacket(SYNETPEER_PACKET_PONG, stamp);
@@ -1328,6 +1353,47 @@ void syNetPeerHandleTimingPacket(const u8 *buffer, s32 size)
 	sSYNetPeerRttHistogram[(rtt < 20000) ? 0 : (rtt < 50000) ? 1 : (rtt < 100000) ? 2 : (rtt < 150000) ? 3 : 4]++;
 }
 
+// Rollback time sync: when we run a frame or more ahead of the peer, skip a
+// game step now and then (the port re-presents the last frame) so the peer
+// catches up instead of us predicting, and rolling back, ever further ahead.
+// Frame pacing is vsync-bound, so sleeping would not slow us down.
+#define SYNETPEER_TIMESYNC_SKIP_SPACING 30 // frames between skips
+#define SYNETPEER_TIMESYNC_THRESHOLD 3      // skip when 1.5+ frames ahead (in half frames)
+
+u32 sSYNetPeerTimeSyncSkips;
+u32 sSYNetPeerTimeSyncCooldown;
+s32 sSYNetPeerTimeSyncAhead16; // smoothed twice-frames-ahead, x16
+
+sb32 syNetPeerTakeTimeSyncSkip(void)
+{
+	s32 ahead2; // twice the frames we are ahead
+
+	if ((sSYNetPeerIsActive == FALSE) || (sSYNetPeerRollbackIsEnabled == FALSE) ||
+		(sSYNetPeerRemoteAdvantageValid == FALSE) || (syNetPeerCheckBattleExecutionReady() == FALSE))
+	{
+		return FALSE;
+	}
+	// Jitter makes both advantages noisy, and the peer's arrives 4 times a
+	// second; average over ~16 frames so the two sides don't take turns
+	// believing they are ahead.
+	ahead2 = syNetPeerGetLocalAdvantage() - sSYNetPeerRemoteAdvantage;
+	sSYNetPeerTimeSyncAhead16 += ahead2 - (sSYNetPeerTimeSyncAhead16 / 16);
+
+	if (sSYNetPeerTimeSyncCooldown != 0)
+	{
+		sSYNetPeerTimeSyncCooldown--;
+		return FALSE;
+	}
+	if (sSYNetPeerTimeSyncAhead16 < SYNETPEER_TIMESYNC_THRESHOLD * 16)
+	{
+		return FALSE;
+	}
+	sSYNetPeerTimeSyncCooldown = SYNETPEER_TIMESYNC_SKIP_SPACING;
+	sSYNetPeerTimeSyncAhead16 -= 2 * 16; // a skip closes the gap by one frame
+	sSYNetPeerTimeSyncSkips++;
+	return TRUE;
+}
+
 void syNetPeerUpdatePing(void)
 {
 	if (sSYNetPeerPingCountdown == 0)
@@ -1342,11 +1408,17 @@ void syNetPeerLogRtt(void)
 {
 	if (sSYNetPeerRttWindowCount != 0)
 	{
-		port_log("SSB64 NetPeer: rtt avg=%ums max=%ums n=%u\n",
+		port_log("SSB64 NetPeer: rtt avg=%ums max=%ums n=%u adv=%d peer_adv=%d timesync_skips=%u\n",
 		         sSYNetPeerRttWindowSumUsecs / sSYNetPeerRttWindowCount / 1000, sSYNetPeerRttWindowMaxUsecs / 1000,
-		         sSYNetPeerRttWindowCount);
+		         sSYNetPeerRttWindowCount, syNetPeerGetLocalAdvantage(), sSYNetPeerRemoteAdvantage,
+		         sSYNetPeerTimeSyncSkips);
 	}
 	sSYNetPeerRttWindowCount = sSYNetPeerRttWindowSumUsecs = sSYNetPeerRttWindowMaxUsecs = 0;
+}
+#else
+sb32 syNetPeerTakeTimeSyncSkip(void)
+{
+	return FALSE;
 }
 #endif
 
