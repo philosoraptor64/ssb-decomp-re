@@ -565,6 +565,24 @@ void syNetPeerMakeBootstrapMetadata(SYNetInputReplayMetadata *metadata)
 	metadata->fighter_kinds[0] = syNetPeerGetBootstrapFighter(0, nFTKindMario);
 	metadata->player_kinds[1] = nFTPlayerKindMan;
 	metadata->fighter_kinds[1] = syNetPeerGetBootstrapFighter(1, nFTKindFox);
+
+	// SSB64_NETPLAY_P<n>_CPU=<level 1-9> makes that player the game's own
+	// computer opponent. The AI runs inside the simulation on both machines,
+	// so it needs no network input and rollback simply recomputes it.
+	for (player = 0; player < 2; player++)
+	{
+		char key[] = "SSB64_NETPLAY_Pn_CPU";
+		const char *value;
+
+		key[sizeof("SSB64_NETPLAY_P") - 1] = (char)('1' + player);
+		value = getenv(key);
+
+		if ((value != NULL) && (atoi(value) >= 1) && (atoi(value) <= 9))
+		{
+			metadata->player_kinds[player] = nFTPlayerKindCom;
+			metadata->levels[player] = atoi(value);
+		}
+	}
 }
 
 void syNetPeerApplyBootstrapMetadata(const SYNetInputReplayMetadata *metadata)
