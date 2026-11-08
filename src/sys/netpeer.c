@@ -37,6 +37,7 @@ extern void port_netplay_rendezvous_bye(int sock);
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
+#include <n64net_input.h>
 #endif
 
 #define SYNETPEER_MAGIC 0x53534E50 // SSNP
@@ -204,6 +205,11 @@ sb32 sSYNetPeerDesyncReported;
 void syNetPeerSyncCheckReset(void);
 void syNetPeerSyncCheckRecord(u32 tick, u32 kind, u32 hash);
 s32 sSYNetPeerSocket = -1;
+// The input exchange (shared n64net library): ledger, prediction, rollback
+// trigger, time sync, sync checks, away notices. One per connection.
+n64net_input *sSYNetPeerNet;
+static void syNetPeerNetCreate(void);
+static void syNetPeerNetDestroy(void);
 struct sockaddr_in sSYNetPeerBindAddress;
 struct sockaddr_in sSYNetPeerPeerAddress;
 #endif
@@ -487,6 +493,7 @@ void syNetPeerCloseSocket(void)
 {
 #if defined(PORT) && !defined(_WIN32)
 	port_voice_stop();
+	syNetPeerNetDestroy();
 #endif
 	if (sSYNetPeerSocket >= 0)
 	{
@@ -1636,6 +1643,7 @@ void syNetPeerStartVSSession(void)
 // online session).
 void syNetPeerResetSessionCounters(void)
 {
+	syNetPeerNetCreate();
 	sSYNetPeerHighestRemoteTick = 0;
 	sSYNetPeerStallTicks = 0;
 	sSYNetPeerStallUsecs = 0;
@@ -1827,6 +1835,61 @@ sb32 syNetPeerSimSend(const u8 *buffer, u32 size)
 
 	return TRUE;
 }
+
+static void syNetPeerNetSend(void *user, const uint8_t *data, uint32_t size)
+{
+	(void)user;
+	syNetPeerSimSend(data, size);  // through the debug network simulator (SSB64_NETPLAY_SIM_*)
+}
+
+static uint64_t syNetPeerNetNow(void)
+{
+	return syNetPeerSimNowUsecs();
+}
+
+// A new connection (VS match or online session) starts at the current tick.
+static void syNetPeerNetCreate(void)
+{
+	n64net_input_config config;
+
+	syNetPeerNetDestroy();
+	memset(&config, 0, sizeof(config));
+	config.num_players = MAXCONTROLLERS;
+	config.local_player = sSYNetPeerLocalPlayer;
+	config.remote_mask = 1u << sSYNetPeerRemotePlayer;
+	config.session_id = sSYNetPeerSessionID;
+	config.start_tick = syNetInputGetTick();
+	config.input_delay = sSYNetPeerInputDelay;
+	config.rollback_window = 0;  // set per tick (syNetPeerNetSyncWindow)
+	config.ticks_per_second = 60;
+	config.send = syNetPeerNetSend;
+	config.log = port_log;
+	config.now_usecs = syNetPeerNetNow;
+	sSYNetPeerNet = n64net_input_create(&config);
+}
+
+static void syNetPeerNetDestroy(void)
+{
+	if (sSYNetPeerNet != NULL)
+	{
+		n64net_input_destroy(sSYNetPeerNet);
+		sSYNetPeerNet = NULL;
+	}
+}
+
+// Rollback inside battles (when enabled), lockstep everywhere else.
+static void syNetPeerNetSyncWindow(void)
+{
+	sb32 is_rollback = (sSYNetPeerRollbackIsEnabled != FALSE) &&
+	                   ((sSYNetPeerSessionIsActive == FALSE) || (syNetPeerSessionCheckInBattle() != FALSE));
+
+	n64net_input_set_window(sSYNetPeerNet, (is_rollback != FALSE) ? sSYNetPeerRollbackWindow : 0);
+}
+
+void *syNetPeerGetNet(void)
+{
+	return sSYNetPeerNet;
+}
 #endif
 
 void syNetPeerSendLocalInput(void)
@@ -1834,6 +1897,12 @@ void syNetPeerSendLocalInput(void)
 #if defined(PORT) && !defined(_WIN32)
 	u8 buffer[SYNETPEER_PACKET_BYTES];
 	u32 size;
+
+	if (sSYNetPeerNet != NULL)
+	{
+		n64net_input_resend(sSYNetPeerNet);  // sampling sends; this covers losses while waiting
+		return;
+	}
 
 	syNetPeerBuildPacket(buffer, &size);
 
@@ -1973,31 +2042,58 @@ static void syNetPeerHandleAwayPacket(sb32 is_away)
 	sSYNetPeerPeerIsAway = is_away;
 }
 
+// The peer switched apps (n64net away notice; it clears when the peer's
+// inputs flow again).
+static sb32 syNetPeerCheckPeerAway(void)
+{
+	if (sSYNetPeerNet != NULL)
+	{
+		return n64net_input_peer_away(sSYNetPeerNet) ? TRUE : FALSE;
+	}
+	return sSYNetPeerPeerIsAway;
+}
+
+// Giving up needs the peer to have been silent that long too: any packet
+// (a BACK notice, voice, inputs) means it is still there.
+static sb32 syNetPeerCheckPeerSilentFor(u64 usecs)
+{
+	if (sSYNetPeerNet == NULL)
+	{
+		return TRUE;
+	}
+	return (n64net_input_peer_silence_usecs(sSYNetPeerNet) >= usecs) ? TRUE : FALSE;
+}
+
 static u64 syNetPeerGetGiveUpUsecs(void)
 {
-	return (sSYNetPeerPeerIsAway != FALSE) ? SYNETPEER_AWAY_GIVEUP_USECS : SYNETPEER_SESSION_LOCKSTEP_GIVEUP_USECS;
+	return (syNetPeerCheckPeerAway() != FALSE) ? SYNETPEER_AWAY_GIVEUP_USECS : SYNETPEER_SESSION_LOCKSTEP_GIVEUP_USECS;
 }
 
 static void syNetPeerShowWaitStatus(void)
 {
-	port_netplay_status("Online session", (sSYNetPeerPeerIsAway != FALSE) ?
+	port_netplay_status("Online session", (syNetPeerCheckPeerAway() != FALSE) ?
 	                    "The other player switched to another app. Waiting for them to come back..." :
 	                    "Waiting for the other player...");
-	sSYNetPeerAwayStatusShown = sSYNetPeerPeerIsAway;
+	sSYNetPeerAwayStatusShown = syNetPeerCheckPeerAway();
 }
 
 // Called by the iOS lifecycle (main thread, between frames).
 void syNetPeerSetLocalAway(sb32 is_away)
 {
 #if defined(PORT) && !defined(_WIN32)
-	s32 i;
+	s32 i = 0;
 
 	if ((sSYNetPeerIsActive == FALSE) || (sSYNetPeerSocket < 0))
 	{
 		return;
 	}
 	port_log("SSB64 NetPeer: local app %s (tick=%u)\n", (is_away != FALSE) ? "switched away" : "back", syNetInputGetTick());
-	for (i = 0; i < 3; i++)  // UDP: a few copies
+	if (sSYNetPeerNet != NULL)
+	{
+		n64net_input_set_away(sSYNetPeerNet, is_away);
+		i = 3;  // (sent by n64net)
+	}
+	for (; i < 3; i++)  // UDP: a few copies
 	{
 		syNetPeerSendControlPacket((is_away != FALSE) ? SYNETPEER_PACKET_AWAY : SYNETPEER_PACKET_BACK);
 		syNetPeerSendLocalInput();
@@ -2087,12 +2183,13 @@ static sb32 syNetPeerHoldForPeer(void)
 		sSYNetPeerHoldLastSendUsecs = now;
 	}
 	if ((now - sSYNetPeerHoldStartUsecs >= 1000000) &&
-		((sSYNetPeerHoldStatusShown == FALSE) || (sSYNetPeerAwayStatusShown != sSYNetPeerPeerIsAway)))
+		((sSYNetPeerHoldStatusShown == FALSE) || (sSYNetPeerAwayStatusShown != syNetPeerCheckPeerAway())))
 	{
 		syNetPeerShowWaitStatus();
 		sSYNetPeerHoldStatusShown = TRUE;
 	}
-	if (now - sSYNetPeerHoldStartUsecs >= syNetPeerGetGiveUpUsecs())
+	if ((now - sSYNetPeerHoldStartUsecs >= syNetPeerGetGiveUpUsecs()) &&
+		(syNetPeerCheckPeerSilentFor(syNetPeerGetGiveUpUsecs()) != FALSE))
 	{
 		port_netplay_status(NULL, NULL);
 		sSYNetPeerHoldStartUsecs = 0;
@@ -2125,6 +2222,16 @@ sb32 syNetPeerTakeTimeSyncSkip(void)
 	{
 		return TRUE;  // skip this game step, re-present the last frame
 	}
+	if (sSYNetPeerNet != NULL)
+	{
+		syNetPeerNetSyncWindow();
+		if (n64net_timesync_should_skip(sSYNetPeerNet))
+		{
+			sSYNetPeerTimeSyncSkips++;
+			return TRUE;
+		}
+		return FALSE;
+	}
 	if (sSYNetPeerRemoteAdvantageValid == FALSE)
 	{
 		return FALSE;
@@ -2152,6 +2259,10 @@ sb32 syNetPeerTakeTimeSyncSkip(void)
 
 void syNetPeerUpdatePing(void)
 {
+	if (sSYNetPeerNet != NULL)
+	{
+		return;  // n64net measures round trips from its input packets
+	}
 	if (sSYNetPeerPingCountdown == 0)
 	{
 		syNetPeerSendTimingPacket(SYNETPEER_PACKET_PING, (u32)syNetPeerSimNowUsecs());
@@ -2162,6 +2273,18 @@ void syNetPeerUpdatePing(void)
 
 void syNetPeerLogRtt(void)
 {
+	if (sSYNetPeerNet != NULL)
+	{
+		n64net_input_stats st;
+
+		n64net_input_get_stats(sSYNetPeerNet, &st);
+		port_log("SSB64 NetPeer: rtt avg=%ums max=%ums adv=%d peer_adv=%d timesync_skips=%u predictions=%u "
+		         "mispredictions=%u sent=%u recv=%u dropped=%u sync_ok=%u\n",
+		         st.rtt_avg_usecs / 1000, st.rtt_max_usecs / 1000, st.local_advantage, st.remote_advantage,
+		         st.timesync_skips, st.predictions, st.mispredictions, st.packets_sent, st.packets_received,
+		         st.packets_dropped, n64net_sync_matched(sSYNetPeerNet));
+		return;
+	}
 	if (sSYNetPeerRttWindowCount != 0)
 	{
 		port_log("SSB64 NetPeer: rtt avg=%ums max=%ums n=%u adv=%d peer_adv=%d timesync_skips=%u\n",
@@ -2240,6 +2363,11 @@ void syNetPeerSyncCheckRecord(u32 tick, u32 kind, u32 hash)
 	{
 		return;
 	}
+	if (sSYNetPeerNet != NULL)
+	{
+		n64net_sync_record(sSYNetPeerNet, tick, (uint8_t)kind, hash);
+		return;
+	}
 	sSYNetPeerSyncLocalTick[slot] = tick;
 	sSYNetPeerSyncLocalKind[slot] = kind;
 	sSYNetPeerSyncLocalHash[slot] = hash;
@@ -2303,6 +2431,16 @@ void syNetPeerHandlePacket(const u8 *buffer, s32 size)
 #if defined(PORT) && !defined(_WIN32)
 	if (port_voice_handle_packet(buffer, size) != FALSE)
 	{
+		return;
+	}
+	if ((sSYNetPeerNet != NULL) && n64net_input_handle_packet(sSYNetPeerNet, buffer, (uint32_t)size))
+	{
+		u32 confirmed = n64net_input_confirmed_tick(sSYNetPeerNet);
+
+		if ((confirmed != U32_MAX) && (confirmed > sSYNetPeerHighestRemoteTick))
+		{
+			sSYNetPeerHighestRemoteTick = confirmed;  // logs and the hold message
+		}
 		return;
 	}
 	if (size == SYNETPEER_CONTROL_PACKET_BYTES)
@@ -2457,6 +2595,20 @@ void syNetPeerReceiveRemoteInput(void)
 			break;
 		}
 		syNetPeerHandlePacket(buffer, (s32)size);
+	}
+	if ((sSYNetPeerNet != NULL) && (sSYNetPeerDesyncReported == FALSE))
+	{
+		u32 tick;
+		uint8_t kind;
+
+		if (n64net_sync_desynced(sSYNetPeerNet, &tick, &kind))
+		{
+			sSYNetPeerDesyncReported = TRUE;
+			port_log("SSB64 NetPeer: DESYNC detected tick=%u kind=%s (after %u matching checks)\n", tick,
+			         (kind == 0) ? "session" : "battle", n64net_sync_matched(sSYNetPeerNet));
+			port_netplay_alert("The two games have gone out of sync, so what you see may now differ from your "
+			                   "friend's screen. This is a bug: please send both players' logs (Files > BattleShip > ssb64.log).");
+		}
 	}
 #endif
 }
@@ -2814,6 +2966,11 @@ sb32 syNetPeerCheckRemoteInputReady(u32 tick)
 	{
 		return TRUE;
 	}
+	if (sSYNetPeerNet != NULL)
+	{
+		syNetPeerNetSyncWindow();
+		return n64net_input_ready(sSYNetPeerNet, tick) ? TRUE : FALSE;
+	}
 	if ((sSYNetPeerRollbackIsEnabled != FALSE) &&
 		((sSYNetPeerSessionIsActive == FALSE) || (syNetPeerSessionCheckInBattle() != FALSE)))
 	{
@@ -2882,12 +3039,13 @@ void syNetPeerWaitForRemoteInput(u32 tick)
 				waited_usecs = 0;  // back from another app: 30 s from now for its input
 			}
 			if ((waited_usecs >= 1000000) &&
-				((is_status_shown == FALSE) || (sSYNetPeerAwayStatusShown != sSYNetPeerPeerIsAway)))
+				((is_status_shown == FALSE) || (sSYNetPeerAwayStatusShown != syNetPeerCheckPeerAway())))
 			{
 				syNetPeerShowWaitStatus();
 				is_status_shown = TRUE;
 			}
-			if (waited_usecs >= syNetPeerGetGiveUpUsecs())
+			if ((waited_usecs >= syNetPeerGetGiveUpUsecs()) &&
+				(syNetPeerCheckPeerSilentFor(syNetPeerGetGiveUpUsecs()) != FALSE))
 			{
 				syNetPeerSessionEnd("the other player stopped responding");
 				break;
@@ -2945,7 +3103,16 @@ void syNetPeerStopVSSession(void)
 		port_log("SSB64 NetPeer: rtt histogram <20ms=%u <50ms=%u <100ms=%u <150ms=%u >=150ms=%u max=%ums\n",
 		         sSYNetPeerRttHistogram[0], sSYNetPeerRttHistogram[1], sSYNetPeerRttHistogram[2],
 		         sSYNetPeerRttHistogram[3], sSYNetPeerRttHistogram[4], sSYNetPeerRttMaxUsecs / 1000);
-		port_log("SSB64 NetPeer: VS session stop sent=%u recv=%u dropped=%u staged=%u late=%u checksum=0x%08X\n",
+		if (sSYNetPeerNet != NULL)
+		{
+			n64net_input_stats st;
+
+			n64net_input_get_stats(sSYNetPeerNet, &st);
+			port_log("SSB64 NetPeer: VS session stop sent=%u recv=%u dropped=%u predictions=%u mispredictions=%u "
+			         "sync_ok=%u\n", st.packets_sent, st.packets_received, st.packets_dropped, st.predictions,
+			         st.mispredictions, n64net_sync_matched(sSYNetPeerNet));
+		}
+		else port_log("SSB64 NetPeer: VS session stop sent=%u recv=%u dropped=%u staged=%u late=%u checksum=0x%08X\n",
 		         sSYNetPeerPacketsSent, sSYNetPeerPacketsReceived, sSYNetPeerPacketsDropped,
 		         sSYNetPeerFramesStaged, sSYNetPeerLateFrames, sSYNetPeerInputChecksum);
 	}

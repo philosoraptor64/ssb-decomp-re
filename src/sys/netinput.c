@@ -5,6 +5,17 @@
 
 extern void port_log(const char *fmt, ...);
 
+#if defined(PORT) && !defined(_WIN32)
+#include <n64net_input.h>
+// The connection's input exchange (netpeer), NULL when not online. With it,
+// the local and remote players' inputs, predictions and rollback requests
+// come from the shared n64net library instead of the histories below.
+extern void *syNetPeerGetNet(void);
+#define SYNETINPUT_NET() ((n64net_input *)syNetPeerGetNet())
+#else
+#define SYNETINPUT_NET() NULL
+#endif
+
 typedef struct SYNetInputSlot
 {
 	SYNetInputSource source;
@@ -246,11 +257,32 @@ void syNetInputSetRemoteInput(s32 player, u32 tick, u16 buttons, s8 stick_x, s8 
 
 sb32 syNetInputCheckRollbackPendingBefore(u32 tick)
 {
+#if defined(PORT) && !defined(_WIN32)
+	if (SYNETINPUT_NET() != NULL)
+	{
+		uint32_t pending;
+
+		return (n64net_peek_rollback(SYNETINPUT_NET(), &pending) && (pending < tick)) ? TRUE : FALSE;
+	}
+#endif
 	return ((sSYNetInputRollbackPending != FALSE) && (sSYNetInputRollbackTick < tick)) ? TRUE : FALSE;
 }
 
 sb32 syNetInputTakeRollbackTick(u32 *out_tick)
 {
+#if defined(PORT) && !defined(_WIN32)
+	if (SYNETINPUT_NET() != NULL)
+	{
+		uint32_t tick;
+
+		if (n64net_take_rollback(SYNETINPUT_NET(), &tick) == 0)
+		{
+			return FALSE;
+		}
+		*out_tick = tick;
+		return TRUE;
+	}
+#endif
 	if (sSYNetInputRollbackPending == FALSE)
 	{
 		return FALSE;
@@ -407,8 +439,64 @@ void syNetInputMakePredictedFrame(s32 player, u32 tick, SYNetInputFrame *out_fra
 	else syNetInputMakeFrame(out_frame, tick, 0, 0, 0, nSYNetInputSourceRemotePredicted, TRUE);
 }
 
+#if defined(PORT) && !defined(_WIN32)
+// Online: this machine's player (sampled once per tick, applied after the
+// input delay) and the remote player (confirmed or predicted) via n64net.
+static sb32 syNetInputResolveNetFrame(s32 player, u32 tick, SYNetInputFrame *out_frame)
+{
+	n64net_input *net = SYNETINPUT_NET();
+	SYNetInputFrame sample;
+	n64net_pad pad;
+	int is_predicted;
+
+	if (net == NULL)
+	{
+		return FALSE;
+	}
+	if (sSYNetInputSlots[player].source == nSYNetInputSourceLocal)
+	{
+		if (syNetPeerCheckLocalPlayer(player) == FALSE)
+		{
+			return FALSE;
+		}
+		// Sample only on ticks that will actually advance, never in a resimulation.
+		if ((syNetPeerCheckStartBarrierReleased() != FALSE) && (syNetInputCheckResimulating() == FALSE))
+		{
+			syNetInputMakeLocalFrame(player, tick, &sample);
+			pad.buttons = sample.buttons;
+			pad.stick_x = sample.stick_x;
+			pad.stick_y = sample.stick_y;
+			n64net_input_set_local(net, tick, pad);
+		}
+		n64net_input_get(net, player, tick, &pad);
+		syNetInputMakeFrame(out_frame, tick, pad.buttons, pad.stick_x, pad.stick_y, nSYNetInputSourceLocal, FALSE);
+		return TRUE;
+	}
+	if ((sSYNetInputSlots[player].source == nSYNetInputSourceRemoteConfirmed) ||
+		(sSYNetInputSlots[player].source == nSYNetInputSourceRemotePredicted))
+	{
+		is_predicted = n64net_input_get(net, player, tick, &pad);
+		syNetInputMakeFrame(out_frame, tick, pad.buttons, pad.stick_x, pad.stick_y,
+		                    is_predicted ? nSYNetInputSourceRemotePredicted : nSYNetInputSourceRemoteConfirmed,
+		                    is_predicted ? TRUE : FALSE);
+		if (is_predicted == 0)
+		{
+			sSYNetInputSlots[player].last_confirmed = *out_frame;
+		}
+		return TRUE;
+	}
+	return FALSE;
+}
+#endif
+
 void syNetInputResolveFrame(s32 player, u32 tick, SYNetInputFrame *out_frame)
 {
+#if defined(PORT) && !defined(_WIN32)
+	if (syNetInputResolveNetFrame(player, tick, out_frame) != FALSE)
+	{
+		return;
+	}
+#endif
 	switch (sSYNetInputSlots[player].source)
 	{
 	case nSYNetInputSourceRemoteConfirmed:
