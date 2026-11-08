@@ -81,7 +81,12 @@ void syNetPeerHandleTimingPacket(const u8 *buffer, s32 size);
 // Online sessions ("connected as if local"): the host's save data for the
 // session (unlocks, records, settings), sent during the handshake.
 #define SYNETPEER_PACKET_SESSION_DATA 8
-#define SYNETPEER_SESSION_DATA_PACKET_BYTES (4 + 2 + 2 + 4 + 4 + sizeof(LBBackupData) + 4)
+// Gameplay settings snapshot (port/net/netplay_settings.cpp): 16 x s32.
+#define SYNETPEER_SESSION_SETTINGS_COUNT 16
+extern void port_netplay_settings_capture(s32 *out);
+extern void port_netplay_settings_begin(const s32 *values);
+extern void port_netplay_settings_end(void);
+#define SYNETPEER_SESSION_DATA_PACKET_BYTES (4 + 2 + 2 + 4 + 4 + sizeof(LBBackupData) + (4 * SYNETPEER_SESSION_SETTINGS_COUNT) + 4)
 #define SYNETPEER_SESSION_LOCKSTEP_GIVEUP_USECS 30000000  // peer silent this long: end the session
 // Live desync detection: both machines send their state fingerprints (menu
 // SessionSync, battle fighter checkpoints) and compare them with their own.
@@ -184,6 +189,7 @@ sb32 sSYNetPeerSessionIsEnabled;
 sb32 sSYNetPeerSessionIsActive;
 sb32 sSYNetPeerSessionDataReceived;
 LBBackupData sSYNetPeerSessionBackup;
+s32 sSYNetPeerSessionSettings[SYNETPEER_SESSION_SETTINGS_COUNT];
 u32 sSYNetPeerSessionRandom;
 sb32 sSYNetPeerSessionRollbackArmed;  // rollback configured: used inside session battles
 // Recent fingerprints (tick, kind, hash) from this machine and the peer.
@@ -789,12 +795,14 @@ void syNetPeerHandleMatchConfigPacket(const u8 *buffer, s32 size)
 	}
 }
 
-// Host -> joiner: the save data both machines use during the session.
+// Host -> joiner: the save data and gameplay settings both machines use
+// during the session.
 void syNetPeerSendSessionDataPacket(void)
 {
 	u8 buffer[SYNETPEER_SESSION_DATA_PACKET_BYTES];
 	u8 *cursor = buffer;
 	u32 checksum;
+	s32 i;
 
 	syNetPeerWriteU32(&cursor, SYNETPEER_MAGIC);
 	syNetPeerWriteU16(&cursor, SYNETPEER_VERSION);
@@ -803,6 +811,11 @@ void syNetPeerSendSessionDataPacket(void)
 	syNetPeerWriteU32(&cursor, (u32)sizeof(LBBackupData));
 	memcpy(cursor, &gSCManagerBackupData, sizeof(LBBackupData));
 	cursor += sizeof(LBBackupData);
+	port_netplay_settings_capture(sSYNetPeerSessionSettings);
+	for (i = 0; i < SYNETPEER_SESSION_SETTINGS_COUNT; i++)
+	{
+		syNetPeerWriteU32(&cursor, (u32)sSYNetPeerSessionSettings[i]);
+	}
 	checksum = syNetPeerChecksumBytes(buffer, cursor - buffer);
 	syNetPeerWriteU32(&cursor, checksum);
 	syNetPeerSendBytes(buffer, sizeof(buffer));
@@ -828,6 +841,15 @@ void syNetPeerHandleSessionDataPacket(const u8 *buffer, s32 size)
 		return;
 	}
 	memcpy(&sSYNetPeerSessionBackup, cursor, sizeof(LBBackupData));
+	cursor += sizeof(LBBackupData);
+	{
+		s32 i;
+
+		for (i = 0; i < SYNETPEER_SESSION_SETTINGS_COUNT; i++)
+		{
+			sSYNetPeerSessionSettings[i] = (s32)syNetPeerReadU32(&cursor);
+		}
+	}
 	sSYNetPeerSessionDataReceived = TRUE;
 }
 
@@ -854,7 +876,9 @@ void syNetPeerHandleBootstrapPacket(const u8 *buffer, s32 size)
 
 void syNetPeerReceiveBootstrapPackets(void)
 {
-	u8 buffer[SYNETPEER_BOOTSTRAP_PACKET_BYTES];
+	// Big enough for every handshake packet (the session data is the largest).
+	u8 buffer[(SYNETPEER_SESSION_DATA_PACKET_BYTES > SYNETPEER_BOOTSTRAP_PACKET_BYTES) ? SYNETPEER_SESSION_DATA_PACKET_BYTES
+	                                                                                    : SYNETPEER_BOOTSTRAP_PACKET_BYTES];
 
 	while (TRUE)
 	{
@@ -1021,6 +1045,9 @@ void syNetPeerSessionBegin(void)
 		// (never written to this machine's save: see lbBackupWrite).
 		gSCManagerBackupData = sSYNetPeerSessionBackup;
 	}
+	else port_netplay_settings_capture(sSYNetPeerSessionSettings);  // the host: its own settings
+	// Both use the host's gameplay settings until the session ends.
+	port_netplay_settings_begin(sSYNetPeerSessionSettings);
 	syNetInputReset();
 	for (player = 0; player < MAXCONTROLLERS; player++)
 	{
@@ -1050,9 +1077,14 @@ void syNetPeerSessionBegin(void)
 		gSCManagerSceneData.scene_curr = atoi(getenv("SSB64_NETPLAY_SESSION_START_SCENE"));
 	}
 	port_netplay_status(NULL, NULL);
-	port_log("SSB64 NetPeer: session started role=%s local=%d remote=%d delay=%u seed=%u backup=%u bytes\n",
+	port_log("SSB64 NetPeer: session started role=%s local=%d remote=%d delay=%u seed=%u backup=%u bytes "
+	         "settings=%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
 	         (sSYNetPeerBootstrapIsHost != FALSE) ? "host" : "joiner", sSYNetPeerLocalPlayer, sSYNetPeerRemotePlayer,
-	         sSYNetPeerInputDelay, sSYNetPeerSessionRandom, (u32)sizeof(LBBackupData));
+	         sSYNetPeerInputDelay, sSYNetPeerSessionRandom, (u32)sizeof(LBBackupData),
+	         sSYNetPeerSessionSettings[0], sSYNetPeerSessionSettings[1], sSYNetPeerSessionSettings[2],
+	         sSYNetPeerSessionSettings[3], sSYNetPeerSessionSettings[4], sSYNetPeerSessionSettings[5],
+	         sSYNetPeerSessionSettings[6], sSYNetPeerSessionSettings[7], sSYNetPeerSessionSettings[8],
+	         sSYNetPeerSessionSettings[9], sSYNetPeerSessionSettings[10], sSYNetPeerSessionSettings[11]);
 }
 
 // The session ends (the peer is gone): both games carry on offline.
@@ -1068,6 +1100,7 @@ void syNetPeerSessionEnd(const char *reason)
 	sSYNetPeerSessionIsActive = FALSE;
 	sSYNetPeerIsActive = FALSE;
 	sSYNetPeerRollbackIsEnabled = FALSE;
+	port_netplay_settings_end();
 	syNetPeerCloseSocket();
 	for (player = 0; player < MAXCONTROLLERS; player++)
 	{
