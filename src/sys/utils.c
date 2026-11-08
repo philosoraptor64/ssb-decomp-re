@@ -222,19 +222,40 @@ s32 syUtilsRandIntRange(s32 range)
 #endif
 }
 
+#ifdef PORT
+/* Online sessions: the menus' "random" picks (random fighter, random stage,
+ * title effects) come from the clock, which differs between the two players'
+ * devices. While a session is active they use a generator seeded from the
+ * session config instead (sys/netpeer.c), so both games pick the same. */
+extern sb32 syNetPeerSessionCheckActive(void);
+extern u32 syNetPeerSessionNextRandom(void);
+
+static u32 syUtilsGetTimeRandomSource(void)
+{
+    if (syNetPeerSessionCheckActive() != FALSE)
+    {
+        return syNetPeerSessionNextRandom();
+    }
+    return osGetTime();
+}
+#define SYUTILS_TIME_SOURCE() syUtilsGetTimeRandomSource()
+#else
+#define SYUTILS_TIME_SOURCE() osGetTime()
+#endif
+
 u8 syUtilsRandTimeUChar(void)
 {
-    return osGetTime();
+    return SYUTILS_TIME_SOURCE();
 }
 
 f32 syUtilsRandTimeFloat(void)
 {
-    return (osGetTime() & 0xFF) / 256.0F;
+    return (SYUTILS_TIME_SOURCE() & 0xFF) / 256.0F;
 }
 
 s32 syUtilsRandTimeUCharRange(s32 range)
 {
-    return ((s32)(osGetTime() & 0xFF) * range) / 256.0F;
+    return ((s32)(SYUTILS_TIME_SOURCE() & 0xFF) * range) / 256.0F;
 }
 
 void syUtilsSwapMem(u8 *buf1, u8 *buf2, s32 len)

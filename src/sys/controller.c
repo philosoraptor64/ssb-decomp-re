@@ -1,4 +1,5 @@
 #include "controller.h"
+#include <sys/netpeer.h>
 
 #include <sys/main.h>
 #include <sys/scheduler.h>
@@ -327,12 +328,28 @@ void syControllerScheduleRead(void)
     syControllerDispatchEvent(&evt);
 }
 
-void syControllerFuncRead(void)
+// This machine's controllers only (the netplay input layer builds on it).
+void syControllerFuncReadLocal(void)
 {
     ControllerEvent evt;
 
     evt.type = CONT_EVENT_UPDATE_GLOBAL_DATA;
     syControllerDispatchEvent(&evt);
+}
+
+// Controller read for every menu scene. During an online session it reads
+// the synchronized inputs of both players instead (sys/netpeer.c), so the
+// whole game runs as if both controllers were on this console.
+void syControllerFuncRead(void)
+{
+#ifdef PORT
+    if (syNetPeerSessionCheckActive() != FALSE)
+    {
+        syNetPeerSessionFuncRead();
+        return;
+    }
+#endif
+    syControllerFuncReadLocal();
 }
 
 void unref_80004338(s32 arg0, s32 arg1)

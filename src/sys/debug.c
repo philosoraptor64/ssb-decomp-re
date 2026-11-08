@@ -577,7 +577,14 @@ s32 syDebugWaitFramebufferOrController(u32 buttons, void *framebuf)
     while (TRUE) 
     {
         syDebugWaitMsec(16);
+#ifdef PORT
+        // Only this machine's controllers: this hang-detector thread runs on
+        // its own schedule, so in an online session its reads must not count
+        // as shared game ticks (they shifted one player's timeline).
+        syControllerFuncReadLocal();
+#else
         syControllerFuncRead();
+#endif
 
         if ((framebuf != NULL) && (osViGetCurrentFramebuffer() != framebuf))
         {

@@ -130,6 +130,7 @@ extern SYController gSYControllerMain;
 
 extern void syControllerScheduleRead(void);
 extern void syControllerFuncRead(void);
+extern void syControllerFuncReadLocal(void);
 extern void syControllerSetAutoRead(s32 shouldSchedule);
 extern void syControllerSetStatusDelay(s32 delay);
 extern void syControllerStartRumble(s32 arg0);

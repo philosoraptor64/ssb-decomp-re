@@ -1,3 +1,4 @@
+#include <sys/netpeer.h>
 #include <ft/fighter.h>
 #include <lb/library.h>
 #include <sc/scene.h>
@@ -39,6 +40,13 @@ sb32 lbBackupIsChecksumValid(void)
 // 0x800D45F4
 void lbBackupWrite(void)
 {
+#ifdef PORT
+    // Online session as the joiner: the data in memory is the host's.
+    if (syNetPeerSessionCheckBorrowedSave() != FALSE)
+    {
+        return;
+    }
+#endif
     gSCManagerBackupData.checksum = lbBackupCreateChecksum(&gSCManagerBackupData);
     syDmaWriteSram(&gSCManagerBackupData, ALIGN(sizeof(LBBackupData),  0x0), sizeof(LBBackupData));
     syDmaWriteSram(&gSCManagerBackupData, ALIGN(sizeof(LBBackupData), 0x10), sizeof(LBBackupData));

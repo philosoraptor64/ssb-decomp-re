@@ -21,6 +21,12 @@ typedef struct SYNetInputSlot
 #endif
 
 SYNetInputSlot sSYNetInputSlots[MAXCONTROLLERS];
+// Held-button auto-repeat for published frames, as the controller thread
+// does it (sys/controller.c: first repeat after 30 reads, then every 5).
+// Derived only from the published history, so both players repeat in step.
+#define SYNETINPUT_REPEAT_DELAY 30
+#define SYNETINPUT_REPEAT_INTERVAL 5
+s32 sSYNetInputRepeatTics[MAXCONTROLLERS];
 SSB64_SNAPSHOT_OUTSIDE SYNetInputFrame sSYNetInputHistory[MAXCONTROLLERS][SYNETINPUT_HISTORY_LENGTH];
 SSB64_SNAPSHOT_OUTSIDE SYNetInputFrame sSYNetInputRemoteHistory[MAXCONTROLLERS][SYNETINPUT_HISTORY_LENGTH];
 SSB64_SNAPSHOT_OUTSIDE SYNetInputFrame sSYNetInputSavedHistory[MAXCONTROLLERS][SYNETINPUT_HISTORY_LENGTH];
@@ -127,6 +133,11 @@ void syNetInputReset(void)
 
 	sSYNetInputTick = 0;
 	sSYNetInputLocalDelay = 0;
+
+	for (player = 0; player < MAXCONTROLLERS; player++)
+	{
+		sSYNetInputRepeatTics[player] = SYNETINPUT_REPEAT_DELAY;
+	}
 	sSYNetInputRollbackPending = FALSE;
 	sSYNetInputRecordedFrameCount = 0;
 	sSYNetInputIsRecording = FALSE;
@@ -185,6 +196,10 @@ void syNetInputReset(void)
 
 void syNetInputStartVSSession(void)
 {
+	if (syNetPeerSessionCheckActive() != FALSE)
+	{
+		return;  // one continuous tick for the whole online session
+	}
 	syNetInputReset();
 }
 
@@ -429,11 +444,26 @@ void syNetInputPublishFrame(s32 player, SYNetInputFrame *frame)
 	u16 prev_buttons = (last_published->is_valid != FALSE) ? last_published->buttons : 0;
 	u16 pressed = (frame->buttons ^ prev_buttons) & frame->buttons;
 	u16 released = (frame->buttons ^ prev_buttons) & prev_buttons;
+	u16 update;
 
+	if (frame->buttons != prev_buttons)
+	{
+		update = pressed;
+		sSYNetInputRepeatTics[player] = SYNETINPUT_REPEAT_DELAY;
+	}
+	else if (--sSYNetInputRepeatTics[player] > 0)
+	{
+		update = 0;
+	}
+	else
+	{
+		update = frame->buttons;
+		sSYNetInputRepeatTics[player] = SYNETINPUT_REPEAT_INTERVAL;
+	}
 	gSYControllerDevices[player].button_hold = frame->buttons;
 	gSYControllerDevices[player].button_tap = pressed;
 	gSYControllerDevices[player].button_release = released;
-	gSYControllerDevices[player].button_update = pressed;
+	gSYControllerDevices[player].button_update = update;
 	gSYControllerDevices[player].stick_range.x = frame->stick_x;
 	gSYControllerDevices[player].stick_range.y = frame->stick_y;
 
@@ -692,7 +722,7 @@ void syNetInputFuncRead(void)
 	u32 tick;
 	s32 player;
 
-	syControllerFuncRead();
+	syControllerFuncReadLocal();
 	for (player = 0; player < MAXCONTROLLERS; player++)
 	{
 		sSYNetInputPhysicalDevices[player] = gSYControllerDevices[player];

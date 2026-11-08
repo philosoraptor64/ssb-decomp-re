@@ -78,6 +78,11 @@ void syNetPeerHandleTimingPacket(const u8 *buffer, s32 size);
 #define SYNETPEER_PACKET_PING 6
 #define SYNETPEER_PACKET_PONG 7
 #define SYNETPEER_TIMING_PACKET_BYTES (4 + 2 + 2 + 4 + 4 + 4 + 4)
+// Online sessions ("connected as if local"): the host's save data for the
+// session (unlocks, records, settings), sent during the handshake.
+#define SYNETPEER_PACKET_SESSION_DATA 8
+#define SYNETPEER_SESSION_DATA_PACKET_BYTES (4 + 2 + 2 + 4 + 4 + sizeof(LBBackupData) + 4)
+#define SYNETPEER_SESSION_LOCKSTEP_GIVEUP_USECS 30000000  // peer silent this long: end the session
 #define SYNETPEER_PING_INTERVAL 15 // ticks between round-trip probes
 
 typedef struct SYNetPeerPacketFrame
@@ -165,6 +170,17 @@ sb32 sSYNetPeerUseRendezvous;
 sb32 sSYNetPeerLobbyIsEnabled;
 sb32 sSYNetPeerLobbyMatchOnline;  // this match is being played online
 sb32 sSYNetPeerLobbyHasMetadata;  // host: config captured from the menus
+// Online session (SSB64_NETPLAY_MODE=session): connected at launch, then the
+// whole game (menus, battles, results) runs on both machines from the same
+// inputs, as if both controllers were plugged into one console. One
+// continuous netinput tick for the session; lockstep outside battles,
+// rollback (if enabled) inside them.
+sb32 sSYNetPeerSessionIsEnabled;
+sb32 sSYNetPeerSessionIsActive;
+sb32 sSYNetPeerSessionDataReceived;
+LBBackupData sSYNetPeerSessionBackup;
+u32 sSYNetPeerSessionRandom;
+sb32 sSYNetPeerSessionRollbackArmed;  // rollback configured: used inside session battles
 s32 sSYNetPeerSocket = -1;
 struct sockaddr_in sSYNetPeerBindAddress;
 struct sockaddr_in sSYNetPeerPeerAddress;
@@ -760,6 +776,48 @@ void syNetPeerHandleMatchConfigPacket(const u8 *buffer, s32 size)
 	}
 }
 
+// Host -> joiner: the save data both machines use during the session.
+void syNetPeerSendSessionDataPacket(void)
+{
+	u8 buffer[SYNETPEER_SESSION_DATA_PACKET_BYTES];
+	u8 *cursor = buffer;
+	u32 checksum;
+
+	syNetPeerWriteU32(&cursor, SYNETPEER_MAGIC);
+	syNetPeerWriteU16(&cursor, SYNETPEER_VERSION);
+	syNetPeerWriteU16(&cursor, SYNETPEER_PACKET_SESSION_DATA);
+	syNetPeerWriteU32(&cursor, sSYNetPeerSessionID);
+	syNetPeerWriteU32(&cursor, (u32)sizeof(LBBackupData));
+	memcpy(cursor, &gSCManagerBackupData, sizeof(LBBackupData));
+	cursor += sizeof(LBBackupData);
+	checksum = syNetPeerChecksumBytes(buffer, cursor - buffer);
+	syNetPeerWriteU32(&cursor, checksum);
+	syNetPeerSendBytes(buffer, sizeof(buffer));
+}
+
+void syNetPeerHandleSessionDataPacket(const u8 *buffer, s32 size)
+{
+	const u8 *cursor = buffer;
+	const u8 *trailer = buffer + size - 4;
+	u32 length;
+
+	if ((syNetPeerReadU32(&cursor) != SYNETPEER_MAGIC) || (syNetPeerReadU16(&cursor) != SYNETPEER_VERSION) ||
+		(syNetPeerReadU16(&cursor) != SYNETPEER_PACKET_SESSION_DATA) || (syNetPeerReadU32(&cursor) != sSYNetPeerSessionID))
+	{
+		sSYNetPeerPacketsDropped++;
+		return;
+	}
+	length = syNetPeerReadU32(&cursor);
+
+	if ((length != sizeof(LBBackupData)) || (syNetPeerChecksumBytes(buffer, size - 4) != syNetPeerReadU32(&trailer)))
+	{
+		sSYNetPeerPacketsDropped++;
+		return;
+	}
+	memcpy(&sSYNetPeerSessionBackup, cursor, sizeof(LBBackupData));
+	sSYNetPeerSessionDataReceived = TRUE;
+}
+
 void syNetPeerHandleBootstrapPacket(const u8 *buffer, s32 size)
 {
 	if (size == SYNETPEER_CONTROL_PACKET_BYTES)
@@ -773,6 +831,10 @@ void syNetPeerHandleBootstrapPacket(const u8 *buffer, s32 size)
 	else if (size == SYNETPEER_TIMING_PACKET_BYTES)
 	{
 		syNetPeerHandleTimingPacket(buffer, size);
+	}
+	else if (size == (s32)SYNETPEER_SESSION_DATA_PACKET_BYTES)
+	{
+		syNetPeerHandleSessionDataPacket(buffer, size);
 	}
 	else sSYNetPeerPacketsDropped++;
 }
@@ -837,6 +899,10 @@ void syNetPeerRunBootstrapSteps(void)
 		for (i = 0; i < SYNETPEER_BOOTSTRAP_PEER_WAIT_COUNT; i++)
 		{
 			syNetPeerSendMatchConfigPacket();
+			if ((sSYNetPeerSessionIsEnabled != FALSE) && ((i % 4) == 0))
+			{
+				syNetPeerSendSessionDataPacket();
+			}
 			syNetPeerReceiveBootstrapPackets();
 
 			if (sSYNetPeerBootstrapPeerReady != FALSE)
@@ -864,7 +930,8 @@ void syNetPeerRunBootstrapSteps(void)
 		{
 			syNetPeerReceiveBootstrapPackets();
 
-			if (sSYNetPeerBootstrapMetadataApplied != FALSE)
+			if ((sSYNetPeerBootstrapMetadataApplied != FALSE) &&
+				((sSYNetPeerSessionIsEnabled == FALSE) || (sSYNetPeerSessionDataReceived != FALSE)))
 			{
 				syNetPeerSendControlPacket(SYNETPEER_PACKET_READY);
 				break;
@@ -899,6 +966,142 @@ void syNetPeerRunBootstrapSteps(void)
 #endif
 
 #if defined(PORT) && !defined(_WIN32)
+extern void syNetInputReset(void);
+extern void syNetInputFuncRead(void);
+extern void syNetInputSetLocalInputDelay(u32 delay);
+extern void syNetPeerResetSessionCounters(void);
+
+sb32 syNetPeerSessionCheckActive(void)
+{
+	return sSYNetPeerSessionIsActive;
+}
+
+// TRUE while this machine plays a session on the host's save data: it must
+// not be written to this machine's save file (lb/lbbackup.c).
+sb32 syNetPeerSessionCheckBorrowedSave(void)
+{
+	return ((sSYNetPeerSessionIsActive != FALSE) && (sSYNetPeerBootstrapIsHost == FALSE)) ? TRUE : FALSE;
+}
+
+// The menus' clock-based random picks during a session (sys/utils.c).
+u32 syNetPeerSessionNextRandom(void)
+{
+	sSYNetPeerSessionRandom = (sSYNetPeerSessionRandom * 1103515245U) + 12345U;
+	return sSYNetPeerSessionRandom >> 16;
+}
+
+// TRUE when the current scene runs a VS battle (rollback territory);
+// everything else in a session runs in strict lockstep.
+sb32 syNetPeerSessionCheckInBattle(void)
+{
+	return (gSCManagerSceneData.scene_curr == nSCKindVSBattle) ? TRUE : FALSE;
+}
+
+// After a successful handshake: start the session in the VS menu.
+void syNetPeerSessionBegin(void)
+{
+	s32 player;
+
+	if (sSYNetPeerBootstrapIsHost == FALSE)
+	{
+		// The host's unlocks, records and settings for the whole session
+		// (never written to this machine's save: see lbBackupWrite).
+		gSCManagerBackupData = sSYNetPeerSessionBackup;
+	}
+	syNetInputReset();
+	for (player = 0; player < MAXCONTROLLERS; player++)
+	{
+		syNetInputSetSlotSource(player, nSYNetInputSourceSaved);  // neutral unless a player below
+	}
+	syNetInputSetSlotSource(sSYNetPeerLocalPlayer, nSYNetInputSourceLocal);
+	syNetInputSetSlotSource(sSYNetPeerRemotePlayer, nSYNetInputSourceRemotePredicted);
+	syNetInputSetLocalInputDelay(sSYNetPeerInputDelay);
+	syNetPeerResetSessionCounters();
+
+	sSYNetPeerIsActive = TRUE;
+	sSYNetPeerBattleBarrierEnabled = FALSE;
+	sSYNetPeerBattleBarrierReleased = TRUE;
+	sSYNetPeerExecutionBeginLogged = TRUE;
+	sSYNetPeerLockstepIsEnabled = TRUE;
+	sSYNetPeerSessionRandom = sSYNetPeerBootstrapMetadata.rng_seed;
+	sSYNetPeerSessionIsActive = TRUE;
+
+	gSCManagerSceneData.scene_prev = nSCKindTitle;
+	gSCManagerSceneData.scene_curr = nSCKindVSMode;
+	if (getenv("SSB64_NETPLAY_SESSION_START_SCENE") != NULL)
+	{
+		// Unattended tests: start the session somewhere else (e.g. 22 = a VS
+		// battle with the handshake's default players).
+		gSCManagerSceneData.scene_prev = nSCKindVSMode;
+		gSCManagerSceneData.scene_curr = atoi(getenv("SSB64_NETPLAY_SESSION_START_SCENE"));
+	}
+	port_netplay_status(NULL, NULL);
+	port_log("SSB64 NetPeer: session started role=%s local=%d remote=%d delay=%u seed=%u backup=%u bytes\n",
+	         (sSYNetPeerBootstrapIsHost != FALSE) ? "host" : "joiner", sSYNetPeerLocalPlayer, sSYNetPeerRemotePlayer,
+	         sSYNetPeerInputDelay, sSYNetPeerSessionRandom, (u32)sizeof(LBBackupData));
+}
+
+// The session ends (the peer is gone): both games carry on offline.
+void syNetPeerSessionEnd(const char *reason)
+{
+	s32 player;
+
+	if (sSYNetPeerSessionIsActive == FALSE)
+	{
+		return;
+	}
+	port_log("SSB64 NetPeer: session ended: %s\n", reason);
+	sSYNetPeerSessionIsActive = FALSE;
+	sSYNetPeerIsActive = FALSE;
+	sSYNetPeerRollbackIsEnabled = FALSE;
+	syNetPeerCloseSocket();
+	for (player = 0; player < MAXCONTROLLERS; player++)
+	{
+		syNetInputSetSlotSource(player, nSYNetInputSourceLocal);
+	}
+	port_netplay_alert("The online session ended (the other player left or the connection was lost). "
+	                   "You can keep playing offline.");
+}
+
+// Fingerprint of the shared game state outside battles: both machines must
+// produce the same value at the same tick (logged as SSB64 SessionSync).
+u32 syNetPeerSessionHashState(void)
+{
+	SYNetInputReplayMetadata settings;
+	u32 hash = 2166136261U;
+	s32 player;
+
+	syNetReplayCaptureBattleMetadata(&gSCManagerTransferBattleState, &settings);
+	hash = syNetPeerChecksumAccumulateU32(hash, syNetInputGetTick());
+	hash = syNetPeerChecksumAccumulateU32(hash, gSCManagerSceneData.scene_curr);
+	hash = syNetPeerChecksumAccumulateU32(hash, gSCManagerSceneData.scene_prev);
+	hash = syNetPeerChecksumAccumulateU32(hash, gSCManagerSceneData.gkind);
+	hash = syNetPeerChecksumAccumulateU32(hash, sSYNetPeerSessionRandom);
+	hash = syNetPeerChecksumAccumulateU32(hash, (u32)syUtilsRandSeed());  // the game's own RNG (read only)
+	hash = syNetPeerChecksumAccumulateU32(hash, syNetPeerChecksumBytes((const u8 *)&settings, sizeof(settings)));
+	for (player = 0; player < MAXCONTROLLERS; player++)
+	{
+		hash = syNetPeerChecksumAccumulateU32(hash, gSYControllerDevices[player].button_hold);
+		hash = syNetPeerChecksumAccumulateU32(hash, (u8)gSYControllerDevices[player].stick_range.x);
+		hash = syNetPeerChecksumAccumulateU32(hash, (u8)gSYControllerDevices[player].stick_range.y);
+	}
+	return hash;
+}
+
+// Controller read for every non-battle scene during a session
+// (sys/controller.c): the same steps as a battle frame, in lockstep.
+void syNetPeerSessionFuncRead(void)
+{
+	syNetInputFuncRead();
+	syNetPeerUpdate();
+
+	if ((syNetInputGetTick() % 120) == 0)
+	{
+		port_log("SSB64 SessionSync: tick=%u scene=%u hash=%08X\n", syNetInputGetTick(),
+		         gSCManagerSceneData.scene_curr, syNetPeerSessionHashState());
+	}
+}
+
 // Called at the start of every VS battle scene (scVSBattleStartScene), before
 // the battle reads gSCManagerTransferBattleState. Returns TRUE if the scene
 // should be abandoned (the joiner gave up waiting; it goes to the title).
@@ -1027,6 +1230,10 @@ s32 syNetPeerLobbyGetNextScene(s32 scene)
 	return scene;
 }
 #else
+sb32 syNetPeerSessionCheckActive(void) { return FALSE; }
+sb32 syNetPeerSessionCheckBorrowedSave(void) { return FALSE; }
+u32 syNetPeerSessionNextRandom(void) { return 0; }
+void syNetPeerSessionFuncRead(void) { }
 sb32 syNetPeerLobbyBeginMatch(void) { return FALSE; }
 sb32 syNetPeerLobbyCheckMatchOnline(void) { return FALSE; }
 s32 syNetPeerLobbyGetNextScene(s32 scene) { return scene; }
@@ -1218,6 +1425,57 @@ void syNetPeerInitDebugEnv(void)
 	         sSYNetPeerSessionID, sSYNetPeerBootstrapIsEnabled, sSYNetPeerBootstrapIsHost,
 	         sSYNetPeerBootstrapSeed, bind_env, peer_env);
 
+	sSYNetPeerSessionIsEnabled = (getenv("SSB64_NETPLAY_MODE") != NULL) &&
+	                             (syNetPeerStringEquals(getenv("SSB64_NETPLAY_MODE"), "session") != FALSE) &&
+	                             (sSYNetPeerUseRendezvous != FALSE);
+	if (sSYNetPeerSessionIsEnabled != FALSE)
+	{
+		struct timespec ts;
+
+		// Rollback only inside battles; the menus run in lockstep.
+		sSYNetPeerSessionRollbackArmed = sSYNetPeerRollbackIsEnabled;
+		sSYNetPeerRollbackIsEnabled = FALSE;
+		sSYNetPeerBootstrapIsEnabled = TRUE;
+
+		if (sSYNetPeerBootstrapIsHost != FALSE)
+		{
+			// The host's VS rules and a fresh seed (the joiner adopts both).
+			// Players come from the defaults (they're picked in the menus).
+			SYNetInputReplayMetadata rules;
+
+			syNetReplayCaptureBattleMetadata(&gSCManagerTransferBattleState, &rules);
+			syNetPeerMakeBootstrapMetadata(&sSYNetPeerBootstrapMetadata);
+			sSYNetPeerBootstrapMetadata.stocks = rules.stocks;
+			sSYNetPeerBootstrapMetadata.time_limit = rules.time_limit;
+			sSYNetPeerBootstrapMetadata.item_switch = rules.item_switch;
+			sSYNetPeerBootstrapMetadata.item_toggles = rules.item_toggles;
+			sSYNetPeerBootstrapMetadata.game_rules = rules.game_rules;
+			sSYNetPeerBootstrapMetadata.is_team_battle = rules.is_team_battle;
+			sSYNetPeerBootstrapMetadata.handicap = rules.handicap;
+			sSYNetPeerBootstrapMetadata.is_team_attack = rules.is_team_attack;
+			sSYNetPeerBootstrapMetadata.damage_ratio = rules.damage_ratio;
+			sSYNetPeerBootstrapMetadata.item_appearance_rate = rules.item_appearance_rate;
+			clock_gettime(CLOCK_REALTIME, &ts);
+			sSYNetPeerBootstrapMetadata.rng_seed = (u32)ts.tv_sec ^ (u32)ts.tv_nsec;
+			sSYNetPeerLobbyHasMetadata = TRUE;
+		}
+		syNetPeerRunBootstrap();
+
+		if ((sSYNetPeerIsActive != FALSE) &&
+			((sSYNetPeerBootstrapIsHost != FALSE) ? (sSYNetPeerBootstrapPeerReady != FALSE) : (sSYNetPeerBootstrapStartReceived != FALSE)))
+		{
+			syNetPeerSessionBegin();
+		}
+		else
+		{
+			syNetPeerCloseSocket();
+			sSYNetPeerIsActive = FALSE;
+			sSYNetPeerIsEnabled = FALSE;
+			port_netplay_alert("Couldn't start the online session. Playing offline.");
+		}
+		return;
+	}
+
 	sSYNetPeerLobbyIsEnabled = (getenv("SSB64_NETPLAY_LOBBY") != NULL) && (atoi(getenv("SSB64_NETPLAY_LOBBY")) != 0) &&
 	                           (sSYNetPeerUseRendezvous != FALSE);
 	if (sSYNetPeerLobbyIsEnabled != FALSE)
@@ -1256,29 +1514,20 @@ void syNetPeerStartVSSession(void)
 	{
 		return;
 	}
+	if (sSYNetPeerSessionIsActive != FALSE)
+	{
+		// One continuous session: keep the connection, tick and slots; only
+		// arm rollback (if configured) for the battle.
+		sSYNetPeerRollbackIsEnabled = sSYNetPeerSessionRollbackArmed;
+		sSYNetPeerNextCheckpointTick = syNetInputGetTick();
+		port_log("SSB64 NetPeer: session battle start tick=%u rollback=%d\n", syNetInputGetTick(), sSYNetPeerRollbackIsEnabled);
+		return;
+	}
 	if (syNetPeerOpenSocket() == FALSE)
 	{
 		return;
 	}
-	sSYNetPeerHighestRemoteTick = 0;
-	sSYNetPeerStallTicks = 0;
-	sSYNetPeerStallUsecs = 0;
-	sSYNetPeerStallTimeouts = 0;
-	sSYNetPeerPacketsSent = 0;
-	sSYNetPeerPacketsReceived = 0;
-	sSYNetPeerPacketsDropped = 0;
-	sSYNetPeerFramesStaged = 0;
-	sSYNetPeerLateFrames = 0;
-	sSYNetPeerInputChecksum = 2166136261U;
-	sSYNetPeerLastLogTick = 0;
-	sSYNetPeerSendSeq = 0;
-	sSYNetPeerRecvSeqInitialized = FALSE;
-	sSYNetPeerRecvSeqHighWater = 0;
-	sSYNetPeerSeqGaps = 0;
-	sSYNetPeerSeqDuplicates = 0;
-	sSYNetPeerSeqOutOfOrder = 0;
-	sSYNetPeerLastPeerAckTick = 0;
-	sSYNetPeerLastPacketTicksValid = FALSE;
+	syNetPeerResetSessionCounters();
 	sSYNetPeerIsActive = TRUE;
 	sSYNetPeerBattleBarrierEnabled = sSYNetPeerBootstrapIsEnabled;
 	sSYNetPeerBattleLocalReady = sSYNetPeerBattleBarrierEnabled;
@@ -1301,6 +1550,33 @@ void syNetPeerStartVSSession(void)
 	         sSYNetPeerBattleBarrierEnabled, syNetInputGetTick());
 #endif
 }
+
+#if defined(PORT) && !defined(_WIN32)
+// Per-connection statistics and sequence state (a VS session, or a whole
+// online session).
+void syNetPeerResetSessionCounters(void)
+{
+	sSYNetPeerHighestRemoteTick = 0;
+	sSYNetPeerStallTicks = 0;
+	sSYNetPeerStallUsecs = 0;
+	sSYNetPeerStallTimeouts = 0;
+	sSYNetPeerPacketsSent = 0;
+	sSYNetPeerPacketsReceived = 0;
+	sSYNetPeerPacketsDropped = 0;
+	sSYNetPeerFramesStaged = 0;
+	sSYNetPeerLateFrames = 0;
+	sSYNetPeerInputChecksum = 2166136261U;
+	sSYNetPeerLastLogTick = 0;
+	sSYNetPeerSendSeq = 0;
+	sSYNetPeerRecvSeqInitialized = FALSE;
+	sSYNetPeerRecvSeqHighWater = 0;
+	sSYNetPeerSeqGaps = 0;
+	sSYNetPeerSeqDuplicates = 0;
+	sSYNetPeerSeqOutOfOrder = 0;
+	sSYNetPeerLastPeerAckTick = 0;
+	sSYNetPeerLastPacketTicksValid = FALSE;
+}
+#endif
 
 sb32 syNetPeerCheckBattleExecutionReady(void)
 {
@@ -1903,6 +2179,14 @@ void syNetPeerLogStats(void)
 	         sSYNetPeerLastPeerAckTick,
 	         sSYNetPeerInputChecksum, sSYNetPeerStallTicks, sSYNetPeerStallUsecs / 1000);
 
+#if !defined(_WIN32)
+	// Fighter checkpoints exist only in battles (sessions log SessionSync
+	// fingerprints elsewhere).
+	if ((sSYNetPeerSessionIsActive != FALSE) && (syNetPeerSessionCheckInBattle() == FALSE))
+	{
+		return;
+	}
+#endif
 	if (sSYNetPeerRollbackIsEnabled == FALSE)
 	{
 		syNetPeerLogNetSyncValidation(tick);
@@ -2155,13 +2439,26 @@ sb32 syNetPeerGetDebugBotInput(s32 player, u32 tick, u16 *buttons, s8 *stick_x, 
 // within the window (older ticks are predicted and corrected later).
 sb32 syNetPeerCheckRemoteInputReady(u32 tick)
 {
-	if (sSYNetPeerRollbackIsEnabled != FALSE)
+	// The first ticks of a session are inside the input delay: neutral on
+	// both machines by definition (and nothing has been sent yet).
+	if ((sSYNetPeerSessionIsActive != FALSE) && (tick < sSYNetPeerInputDelay))
+	{
+		return TRUE;
+	}
+	if ((sSYNetPeerRollbackIsEnabled != FALSE) &&
+		((sSYNetPeerSessionIsActive == FALSE) || (syNetPeerSessionCheckInBattle() != FALSE)))
 	{
 		return ((tick < sSYNetPeerRollbackWindow) || (sSYNetPeerHighestRemoteTick + sSYNetPeerRollbackWindow >= tick))
 		           ? TRUE
 		           : FALSE;
 	}
 	return syNetInputCheckRemoteFrame(sSYNetPeerRemotePlayer, tick);
+}
+
+// TRUE while a netplay battle or online session is running.
+sb32 syNetPeerCheckActive(void)
+{
+	return sSYNetPeerIsActive;
 }
 
 sb32 syNetPeerCheckRollbackEnabled(void)
@@ -2197,9 +2494,29 @@ void syNetPeerWaitForRemoteInput(u32 tick)
 	}
 	sSYNetPeerStallTicks++;
 
+	{
+	// In a session, outside battles, a long wait hands frames back to the
+	// main loop (the app keeps answering the OS and can show a status) and
+	// only gives up after 30 s; elsewhere the old 5 s timeout applies.
+	const sb32 is_session_menu = (sSYNetPeerSessionIsActive != FALSE) && (syNetPeerSessionCheckInBattle() == FALSE);
+	sb32 is_status_shown = FALSE;
+
 	while (syNetPeerCheckRemoteInputReady(tick) == FALSE)
 	{
-		if (waited_usecs >= SYNETPEER_LOCKSTEP_TIMEOUT_USECS)
+		if (is_session_menu != FALSE)
+		{
+			if ((is_status_shown == FALSE) && (waited_usecs >= 1000000))
+			{
+				port_netplay_status("Online session", "Waiting for the other player...");
+				is_status_shown = TRUE;
+			}
+			if (waited_usecs >= SYNETPEER_SESSION_LOCKSTEP_GIVEUP_USECS)
+			{
+				syNetPeerSessionEnd("the other player stopped responding");
+				break;
+			}
+		}
+		else if (waited_usecs >= SYNETPEER_LOCKSTEP_TIMEOUT_USECS)
 		{
 			sSYNetPeerStallTimeouts++;
 			port_log("SSB64 NetPeer: lockstep timeout tick=%u highest_remote=%u; peer lost, predicting from now on\n",
@@ -2207,14 +2524,28 @@ void syNetPeerWaitForRemoteInput(u32 tick)
 			sSYNetPeerLockstepIsEnabled = FALSE;
 			break;
 		}
-		if ((waited_usecs % SYNETPEER_LOCKSTEP_RESEND_USECS) == 0)
+		if ((is_session_menu != FALSE) && (waited_usecs >= 100000))
 		{
 			syNetPeerSendLocalInput();
+			port_netplay_boot_wait();  // one frame back to the main loop (~16 ms)
+			waited_usecs += 16666;
 		}
-		usleep(SYNETPEER_LOCKSTEP_POLL_USECS);
-		waited_usecs += SYNETPEER_LOCKSTEP_POLL_USECS;
-		port_watchdog_note_yield();
+		else
+		{
+			if ((waited_usecs % SYNETPEER_LOCKSTEP_RESEND_USECS) == 0)
+			{
+				syNetPeerSendLocalInput();
+			}
+			usleep(SYNETPEER_LOCKSTEP_POLL_USECS);
+			waited_usecs += SYNETPEER_LOCKSTEP_POLL_USECS;
+			port_watchdog_note_yield();
+		}
 		syNetPeerReceiveRemoteInput();
+	}
+	if (is_status_shown != FALSE)
+	{
+		port_netplay_status(NULL, NULL);
+	}
 	}
 	sSYNetPeerStallUsecs += waited_usecs;
 #endif
@@ -2223,6 +2554,13 @@ void syNetPeerWaitForRemoteInput(u32 tick)
 void syNetPeerStopVSSession(void)
 {
 #if defined(PORT) && !defined(_WIN32)
+	if (sSYNetPeerSessionIsActive != FALSE)
+	{
+		// Back to the menus: keep the session, lockstep again.
+		sSYNetPeerRollbackIsEnabled = FALSE;
+		port_log("SSB64 NetPeer: session battle stop tick=%u\n", syNetInputGetTick());
+		return;
+	}
 	if (sSYNetPeerIsActive != FALSE)
 	{
 		port_log("SSB64 NetPeer: lockstep stalls=%u stall_ms=%u timeouts=%u sim_dropped=%u\n",

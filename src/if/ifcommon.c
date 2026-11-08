@@ -1,3 +1,5 @@
+#include <sys/netinput.h>
+#include <sys/netpeer.h>
 #include <if/interface.h>
 #include <ef/effect.h>
 #include <ft/fighter.h>
@@ -472,6 +474,9 @@ s32 sIFCommonPad0x801317F8;
 
 // 0x801317FC
 u32 sIFCommonTimerStamp;
+#ifdef PORT
+u32 sIFCommonTimerTickBase;  // online: game tick when the timer started
+#endif
 
 // 0x80131800
 u32 sIFCommonTimerIsStarted; // Confirmed u32 by ifCommonBattleUpdateInterfaceAll
@@ -2692,6 +2697,15 @@ void ifCommonTimerFuncRun(GObj *interface_gobj)
     if (sIFCommonTimerIsStarted != FALSE)
     {
         time_update = sySchedulerGetTicCount();
+#ifdef PORT
+        // Online, count game ticks: the video-frame counter also advances
+        // during the port's frame holds, which differ between machines, so
+        // timed matches ended on different ticks.
+        if (syNetPeerCheckActive() != FALSE)
+        {
+            time_update = syNetInputGetTick() - sIFCommonTimerTickBase;
+        }
+#endif
         time_delta = time_update - sIFCommonTimerStamp;
 
         if (time_delta != 0)
@@ -3404,6 +3418,9 @@ void ifCommonBattleUpdateInterfaceAll(void)
         sIFCommonTimerStamp = 0;
 
         sySchedulerSetTicCount(0);
+#ifdef PORT
+        sIFCommonTimerTickBase = syNetInputGetTick();
+#endif
     }
     switch (gSCManagerBattleState->game_status)
     {
