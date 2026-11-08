@@ -83,6 +83,11 @@ void syNetPeerHandleTimingPacket(const u8 *buffer, s32 size);
 #define SYNETPEER_PACKET_SESSION_DATA 8
 #define SYNETPEER_SESSION_DATA_PACKET_BYTES (4 + 2 + 2 + 4 + 4 + sizeof(LBBackupData) + 4)
 #define SYNETPEER_SESSION_LOCKSTEP_GIVEUP_USECS 30000000  // peer silent this long: end the session
+// Live desync detection: both machines send their state fingerprints (menu
+// SessionSync, battle fighter checkpoints) and compare them with their own.
+#define SYNETPEER_PACKET_SYNC_CHECK 9
+#define SYNETPEER_SYNC_CHECK_PACKET_BYTES (4 + 2 + 2 + 4 + 4 + 4 + 4 + 4)
+#define SYNETPEER_SYNC_CHECK_RING 32
 #define SYNETPEER_PING_INTERVAL 15 // ticks between round-trip probes
 
 typedef struct SYNetPeerPacketFrame
@@ -181,6 +186,14 @@ sb32 sSYNetPeerSessionDataReceived;
 LBBackupData sSYNetPeerSessionBackup;
 u32 sSYNetPeerSessionRandom;
 sb32 sSYNetPeerSessionRollbackArmed;  // rollback configured: used inside session battles
+// Recent fingerprints (tick, kind, hash) from this machine and the peer.
+u32 sSYNetPeerSyncLocalTick[SYNETPEER_SYNC_CHECK_RING], sSYNetPeerSyncLocalKind[SYNETPEER_SYNC_CHECK_RING], sSYNetPeerSyncLocalHash[SYNETPEER_SYNC_CHECK_RING];
+u32 sSYNetPeerSyncRemoteTick[SYNETPEER_SYNC_CHECK_RING], sSYNetPeerSyncRemoteKind[SYNETPEER_SYNC_CHECK_RING], sSYNetPeerSyncRemoteHash[SYNETPEER_SYNC_CHECK_RING];
+u32 sSYNetPeerSyncComparedTick[SYNETPEER_SYNC_CHECK_RING];
+u32 sSYNetPeerSyncChecksMatched;
+sb32 sSYNetPeerDesyncReported;
+void syNetPeerSyncCheckReset(void);
+void syNetPeerSyncCheckRecord(u32 tick, u32 kind, u32 hash);
 s32 sSYNetPeerSocket = -1;
 struct sockaddr_in sSYNetPeerBindAddress;
 struct sockaddr_in sSYNetPeerPeerAddress;
@@ -1017,6 +1030,7 @@ void syNetPeerSessionBegin(void)
 	syNetInputSetSlotSource(sSYNetPeerRemotePlayer, nSYNetInputSourceRemotePredicted);
 	syNetInputSetLocalInputDelay(sSYNetPeerInputDelay);
 	syNetPeerResetSessionCounters();
+	syNetPeerSyncCheckReset();
 
 	sSYNetPeerIsActive = TRUE;
 	sSYNetPeerBattleBarrierEnabled = FALSE;
@@ -1092,13 +1106,21 @@ u32 syNetPeerSessionHashState(void)
 // (sys/controller.c): the same steps as a battle frame, in lockstep.
 void syNetPeerSessionFuncRead(void)
 {
+	// Test hook: SSB64_NETPLAY_TEST_DESYNC=<tick> on one machine nudges its
+	// session RNG at that tick, to check that the desync alert fires.
+	if ((getenv("SSB64_NETPLAY_TEST_DESYNC") != NULL) && (syNetInputGetTick() == (u32)atoi(getenv("SSB64_NETPLAY_TEST_DESYNC"))))
+	{
+		sSYNetPeerSessionRandom++;
+	}
 	syNetInputFuncRead();
 	syNetPeerUpdate();
 
 	if ((syNetInputGetTick() % 120) == 0)
 	{
-		port_log("SSB64 SessionSync: tick=%u scene=%u hash=%08X\n", syNetInputGetTick(),
-		         gSCManagerSceneData.scene_curr, syNetPeerSessionHashState());
+		u32 hash = syNetPeerSessionHashState();
+
+		port_log("SSB64 SessionSync: tick=%u scene=%u hash=%08X\n", syNetInputGetTick(), gSCManagerSceneData.scene_curr, hash);
+		syNetPeerSyncCheckRecord(syNetInputGetTick(), 0, hash);
 	}
 }
 
@@ -1528,6 +1550,7 @@ void syNetPeerStartVSSession(void)
 		return;
 	}
 	syNetPeerResetSessionCounters();
+	syNetPeerSyncCheckReset();
 	sSYNetPeerIsActive = TRUE;
 	sSYNetPeerBattleBarrierEnabled = sSYNetPeerBootstrapIsEnabled;
 	sSYNetPeerBattleLocalReady = sSYNetPeerBattleBarrierEnabled;
@@ -1926,6 +1949,110 @@ sb32 syNetPeerTakeTimeSyncSkip(void)
 }
 #endif
 
+#if defined(PORT) && !defined(_WIN32)
+// kind: 0 = SessionSync (outside battles), 1 = battle fighter checkpoint.
+static void syNetPeerSyncCheckCompare(u32 tick, u32 kind, u32 local_hash, u32 remote_hash)
+{
+	if (local_hash == remote_hash)
+	{
+		sSYNetPeerSyncChecksMatched++;
+		return;
+	}
+	if (sSYNetPeerDesyncReported != FALSE)
+	{
+		return;
+	}
+	sSYNetPeerDesyncReported = TRUE;
+	port_log("SSB64 NetPeer: DESYNC detected tick=%u kind=%s local=%08X remote=%08X (after %u matching checks)\n",
+	         tick, (kind == 0) ? "session" : "battle", local_hash, remote_hash, sSYNetPeerSyncChecksMatched);
+	port_netplay_alert("The two games have gone out of sync, so what you see may now differ from your "
+	                   "friend's screen. This is a bug: please send both players' logs (Files > BattleShip > ssb64.log).");
+}
+
+// Forget all fingerprints (a new session or battle starts at tick 0 again).
+void syNetPeerSyncCheckReset(void)
+{
+	s32 i;
+
+	for (i = 0; i < SYNETPEER_SYNC_CHECK_RING; i++)
+	{
+		sSYNetPeerSyncLocalTick[i] = U32_MAX;
+		sSYNetPeerSyncRemoteTick[i] = U32_MAX;
+		sSYNetPeerSyncComparedTick[i] = U32_MAX;
+	}
+	sSYNetPeerSyncChecksMatched = 0;
+	sSYNetPeerDesyncReported = FALSE;
+}
+
+// Compare once both machines' fingerprints for (tick, kind) are known.
+static void syNetPeerSyncCheckTryCompare(u32 slot)
+{
+	if ((sSYNetPeerSyncLocalTick[slot] == U32_MAX) || (sSYNetPeerSyncLocalTick[slot] != sSYNetPeerSyncRemoteTick[slot]) ||
+		(sSYNetPeerSyncLocalKind[slot] != sSYNetPeerSyncRemoteKind[slot]) ||
+		(sSYNetPeerSyncComparedTick[slot] == sSYNetPeerSyncLocalTick[slot]))
+	{
+		return;
+	}
+	sSYNetPeerSyncComparedTick[slot] = sSYNetPeerSyncLocalTick[slot];
+	syNetPeerSyncCheckCompare(sSYNetPeerSyncLocalTick[slot], sSYNetPeerSyncLocalKind[slot],
+	                          sSYNetPeerSyncLocalHash[slot], sSYNetPeerSyncRemoteHash[slot]);
+}
+
+// Record this machine's fingerprint for a tick, send it to the peer, and
+// compare once the peer's arrives (either order).
+void syNetPeerSyncCheckRecord(u32 tick, u32 kind, u32 hash)
+{
+	u8 buffer[SYNETPEER_SYNC_CHECK_PACKET_BYTES];
+	u8 *cursor = buffer;
+	u32 slot = (tick / 120) % SYNETPEER_SYNC_CHECK_RING;
+	s32 i;
+
+	if (sSYNetPeerIsActive == FALSE)
+	{
+		return;
+	}
+	sSYNetPeerSyncLocalTick[slot] = tick;
+	sSYNetPeerSyncLocalKind[slot] = kind;
+	sSYNetPeerSyncLocalHash[slot] = hash;
+
+	syNetPeerWriteU32(&cursor, SYNETPEER_MAGIC);
+	syNetPeerWriteU16(&cursor, SYNETPEER_VERSION);
+	syNetPeerWriteU16(&cursor, SYNETPEER_PACKET_SYNC_CHECK);
+	syNetPeerWriteU32(&cursor, sSYNetPeerSessionID);
+	syNetPeerWriteU32(&cursor, tick);
+	syNetPeerWriteU32(&cursor, kind);
+	syNetPeerWriteU32(&cursor, hash);
+	syNetPeerWriteU32(&cursor, syNetPeerChecksumBytes(buffer, cursor - buffer));
+	for (i = 0; i < 2; i++)  // twice: a lost check only delays detection
+	{
+		syNetPeerSendBytes(buffer, sizeof(buffer));
+	}
+	syNetPeerSyncCheckTryCompare(slot);
+}
+
+void syNetPeerHandleSyncCheckPacket(const u8 *buffer, s32 size)
+{
+	const u8 *cursor = buffer;
+	const u8 *trailer = buffer + size - 4;
+	u32 tick;
+	u32 slot;
+
+	if ((syNetPeerReadU32(&cursor) != SYNETPEER_MAGIC) || (syNetPeerReadU16(&cursor) != SYNETPEER_VERSION) ||
+		(syNetPeerReadU16(&cursor) != SYNETPEER_PACKET_SYNC_CHECK) || (syNetPeerReadU32(&cursor) != sSYNetPeerSessionID) ||
+		(syNetPeerChecksumBytes(buffer, size - 4) != syNetPeerReadU32(&trailer)))
+	{
+		sSYNetPeerPacketsDropped++;
+		return;
+	}
+	tick = syNetPeerReadU32(&cursor);
+	slot = (tick / 120) % SYNETPEER_SYNC_CHECK_RING;
+	sSYNetPeerSyncRemoteTick[slot] = tick;
+	sSYNetPeerSyncRemoteKind[slot] = syNetPeerReadU32(&cursor);
+	sSYNetPeerSyncRemoteHash[slot] = syNetPeerReadU32(&cursor);
+	syNetPeerSyncCheckTryCompare(slot);
+}
+#endif
+
 void syNetPeerHandlePacket(const u8 *buffer, s32 size)
 {
 	const u8 *cursor = buffer;
@@ -1953,6 +2080,11 @@ void syNetPeerHandlePacket(const u8 *buffer, s32 size)
 	if (size == SYNETPEER_TIMING_PACKET_BYTES)
 	{
 		syNetPeerHandleTimingPacket(buffer, size);
+		return;
+	}
+	if (size == SYNETPEER_SYNC_CHECK_PACKET_BYTES)
+	{
+		syNetPeerHandleSyncCheckPacket(buffer, size);
 		return;
 	}
 #endif
@@ -2151,6 +2283,9 @@ void syNetPeerLogNetSyncValidationWithHash(u32 tick, u32 fighter_hash)
 		sSYNetPeerLateFrames,
 		sSYNetPeerInputChecksum,
 		sSYNetPeerLastPacketTicksValid);
+#if defined(PORT) && !defined(_WIN32)
+	syNetPeerSyncCheckRecord(tick, 1, fighter_hash);
+#endif
 }
 #endif
 
