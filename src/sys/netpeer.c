@@ -1939,12 +1939,94 @@ u32 sSYNetPeerTimeSyncSkips;
 u32 sSYNetPeerTimeSyncCooldown;
 s32 sSYNetPeerTimeSyncAhead16; // smoothed twice-frames-ahead, x16
 
+void syNetPeerReceiveRemoteInput(void);
+u64 sSYNetPeerHoldStartUsecs;  // nonzero while holding for a stopped peer
+u64 sSYNetPeerHoldLastSendUsecs;
+sb32 sSYNetPeerHoldStatusShown;
+
+// A rollback battle whose peer stopped sending (e.g. its iPhone app was
+// switched away, which freezes it): hold the game between frames, so the
+// main loop keeps running and nothing is left mid-tick, until the peer is
+// back within the rollback window. After 30 s a session ends; a plain VS
+// match falls back to the tick-level wait's old timeout. Without this the
+// tick-level wait gave up after 5 s and both games went on without each other.
+static sb32 syNetPeerHoldForPeer(void)
+{
+	u64 now;
+
+	if ((sSYNetPeerLockstepIsEnabled == FALSE) || (syNetInputCheckResimulating() != FALSE) ||
+		((sSYNetPeerSessionIsActive != FALSE) && (syNetPeerSessionCheckInBattle() == FALSE)) ||
+		(syNetPeerCheckRemoteInputReady(syNetInputGetTick()) != FALSE))
+	{
+		if (sSYNetPeerHoldStartUsecs != 0)
+		{
+			port_log("SSB64 NetPeer: peer back after %u ms (tick=%u)\n",
+			         (u32)((syNetPeerSimNowUsecs() - sSYNetPeerHoldStartUsecs) / 1000), syNetInputGetTick());
+			if (sSYNetPeerHoldStatusShown != FALSE)
+			{
+				port_netplay_status(NULL, NULL);
+			}
+			sSYNetPeerHoldStartUsecs = 0;
+			sSYNetPeerHoldStatusShown = FALSE;
+		}
+		return FALSE;
+	}
+	syNetPeerReceiveRemoteInput();
+	if (syNetPeerCheckRemoteInputReady(syNetInputGetTick()) != FALSE)
+	{
+		return syNetPeerHoldForPeer();  // arrived just now: logs, clears the hold
+	}
+	now = syNetPeerSimNowUsecs();
+	if (sSYNetPeerHoldStartUsecs == 0)
+	{
+		sSYNetPeerHoldStartUsecs = now;
+		sSYNetPeerHoldLastSendUsecs = 0;
+		port_log("SSB64 NetPeer: holding for the peer (tick=%u highest_remote=%u)\n", syNetInputGetTick(),
+		         sSYNetPeerHighestRemoteTick);
+	}
+	if (now - sSYNetPeerHoldLastSendUsecs >= 100000)
+	{
+		syNetPeerSendLocalInput();  // the peer may have missed our latest
+		sSYNetPeerHoldLastSendUsecs = now;
+	}
+	if ((sSYNetPeerHoldStatusShown == FALSE) && (now - sSYNetPeerHoldStartUsecs >= 1000000))
+	{
+		port_netplay_status("Online session", "Waiting for the other player...");
+		sSYNetPeerHoldStatusShown = TRUE;
+	}
+	if (now - sSYNetPeerHoldStartUsecs >= SYNETPEER_SESSION_LOCKSTEP_GIVEUP_USECS)
+	{
+		port_netplay_status(NULL, NULL);
+		sSYNetPeerHoldStartUsecs = 0;
+		sSYNetPeerHoldStatusShown = FALSE;
+		if (sSYNetPeerSessionIsActive != FALSE)
+		{
+			syNetPeerSessionEnd("the other player stopped responding");
+		}
+		else
+		{
+			port_log("SSB64 NetPeer: peer silent for 30 s; predicting from now on\n");
+			sSYNetPeerLockstepIsEnabled = FALSE;
+		}
+		return FALSE;
+	}
+	return TRUE;
+}
+
 sb32 syNetPeerTakeTimeSyncSkip(void)
 {
 	s32 ahead2; // twice the frames we are ahead
 
 	if ((sSYNetPeerIsActive == FALSE) || (sSYNetPeerRollbackIsEnabled == FALSE) ||
-		(sSYNetPeerRemoteAdvantageValid == FALSE) || (syNetPeerCheckBattleExecutionReady() == FALSE))
+		(syNetPeerCheckBattleExecutionReady() == FALSE))
+	{
+		return FALSE;
+	}
+	if (syNetPeerHoldForPeer() != FALSE)
+	{
+		return TRUE;  // skip this game step, re-present the last frame
+	}
+	if (sSYNetPeerRemoteAdvantageValid == FALSE)
 	{
 		return FALSE;
 	}
