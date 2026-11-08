@@ -322,6 +322,11 @@ void syNetInputMakeLocalFrame(s32 player, u32 tick, SYNetInputFrame *out_frame)
 	);
 	syNetPeerGetDebugBotInput(player, tick, &out_frame->buttons, &out_frame->stick_x, &out_frame->stick_y);
 
+	if ((syNetPeerCheckLocalPlayer(player) != FALSE) && (syNetInputCheckResimulating() == FALSE) &&
+		(syNetPeerTakeInjectStart() != FALSE))
+	{
+		out_frame->buttons |= START_BUTTON;  // back from another app: open the pause menu
+	}
 	if (syNetPeerCheckLocalPlayer(player) != FALSE)
 	{
 		syNetInputLogLocalStickRange(out_frame);

@@ -91,6 +91,9 @@ extern void port_netplay_settings_end(void);
 // Live desync detection: both machines send their state fingerprints (menu
 // SessionSync, battle fighter checkpoints) and compare them with their own.
 #define SYNETPEER_PACKET_SYNC_CHECK 9
+#define SYNETPEER_PACKET_AWAY 10  // control: the app is switching away (iOS); wait longer
+#define SYNETPEER_PACKET_BACK 11  // control: back again
+#define SYNETPEER_AWAY_GIVEUP_USECS 600000000ULL  // an away peer is waited for this long (10 min)
 #define SYNETPEER_SYNC_CHECK_PACKET_BYTES (4 + 2 + 2 + 4 + 4 + 4 + 4 + 4)
 #define SYNETPEER_SYNC_CHECK_RING 32
 #define SYNETPEER_PING_INTERVAL 15 // ticks between round-trip probes
@@ -710,6 +713,8 @@ void syNetPeerSendMatchConfigPacket(void)
 	syNetPeerSendBytes(buffer, SYNETPEER_BOOTSTRAP_PACKET_BYTES);
 }
 
+static void syNetPeerHandleAwayPacket(sb32 is_away);
+
 void syNetPeerHandleControlPacket(const u8 *buffer, s32 size)
 {
 	const u8 *cursor = buffer;
@@ -755,6 +760,10 @@ void syNetPeerHandleControlPacket(const u8 *buffer, s32 size)
 			         syNetInputGetTick(), sSYNetPeerLocalPlayer, sSYNetPeerRemotePlayer);
 		}
 		sSYNetPeerBattlePeerReady = TRUE;
+	}
+	else if ((packet_type == SYNETPEER_PACKET_AWAY) || (packet_type == SYNETPEER_PACKET_BACK))
+	{
+		syNetPeerHandleAwayPacket(packet_type == SYNETPEER_PACKET_AWAY);
 	}
 	else if (packet_type == SYNETPEER_PACKET_BATTLE_START)
 	{
@@ -1940,7 +1949,88 @@ u32 sSYNetPeerTimeSyncCooldown;
 s32 sSYNetPeerTimeSyncAhead16; // smoothed twice-frames-ahead, x16
 
 void syNetPeerReceiveRemoteInput(void);
-u64 sSYNetPeerHoldStartUsecs;  // nonzero while holding for a stopped peer
+
+// Switching apps (iOS): the app tells the peer it is going away, and the
+// peer waits up to 10 minutes instead of 30 s. Coming back, the app presses
+// Start once (a normal input, so both games open the pause menu in sync, as
+// in KartNet): the player resumes from the pause menu when ready.
+sb32 sSYNetPeerPeerIsAway;      // the peer said it switched away
+sb32 sSYNetPeerInjectStart;     // press Start on the next local sample
+static sb32 sSYNetPeerAwayStatusShown;
+u32 sSYNetPeerBackCount;  // BACK notices so far: a wait restarts its 30 s count on each
+
+static void syNetPeerHandleAwayPacket(sb32 is_away)
+{
+	if (sSYNetPeerPeerIsAway != is_away)
+	{
+		port_log("SSB64 NetPeer: peer %s (tick=%u)\n",
+		         (is_away != FALSE) ? "switched away; waiting up to 10 min" : "is back", syNetInputGetTick());
+	}
+	if ((sSYNetPeerPeerIsAway != FALSE) && (is_away == FALSE))
+	{
+		sSYNetPeerBackCount++;
+	}
+	sSYNetPeerPeerIsAway = is_away;
+}
+
+static u64 syNetPeerGetGiveUpUsecs(void)
+{
+	return (sSYNetPeerPeerIsAway != FALSE) ? SYNETPEER_AWAY_GIVEUP_USECS : SYNETPEER_SESSION_LOCKSTEP_GIVEUP_USECS;
+}
+
+static void syNetPeerShowWaitStatus(void)
+{
+	port_netplay_status("Online session", (sSYNetPeerPeerIsAway != FALSE) ?
+	                    "The other player switched to another app. Waiting for them to come back..." :
+	                    "Waiting for the other player...");
+	sSYNetPeerAwayStatusShown = sSYNetPeerPeerIsAway;
+}
+
+// Called by the iOS lifecycle (main thread, between frames).
+void syNetPeerSetLocalAway(sb32 is_away)
+{
+#if defined(PORT) && !defined(_WIN32)
+	s32 i;
+
+	if ((sSYNetPeerIsActive == FALSE) || (sSYNetPeerSocket < 0))
+	{
+		return;
+	}
+	port_log("SSB64 NetPeer: local app %s (tick=%u)\n", (is_away != FALSE) ? "switched away" : "back", syNetInputGetTick());
+	for (i = 0; i < 3; i++)  // UDP: a few copies
+	{
+		syNetPeerSendControlPacket((is_away != FALSE) ? SYNETPEER_PACKET_AWAY : SYNETPEER_PACKET_BACK);
+		syNetPeerSendLocalInput();
+	}
+	if (is_away == FALSE)
+	{
+		sSYNetPeerInjectStart = TRUE;
+	}
+#endif
+}
+
+// netinput, sampling the local controller: TRUE once after coming back, if
+// a VS battle is running unpaused (the press opens the pause menu).
+sb32 syNetPeerTakeInjectStart(void)
+{
+	if (sSYNetPeerInjectStart == FALSE)
+	{
+		return FALSE;
+	}
+	sSYNetPeerInjectStart = FALSE;
+
+	if ((sSYNetPeerIsActive == FALSE) || (gSCManagerSceneData.scene_curr != nSCKindVSBattle) ||
+		(syNetPeerCheckBattleExecutionReady() == FALSE) ||
+		(gSCManagerBattleState->game_status != nSCBattleGameStatusGo))
+	{
+		return FALSE;
+	}
+	port_log("SSB64 NetPeer: back from another app: opening the pause menu (tick=%u)\n", syNetInputGetTick());
+	return TRUE;
+}
+
+u64 sSYNetPeerHoldStartUsecs;  // nonzero while holding for a stopped peer (restarted on BACK)
+u32 sSYNetPeerHoldBackCount;
 u64 sSYNetPeerHoldLastSendUsecs;
 sb32 sSYNetPeerHoldStatusShown;
 
@@ -1968,6 +2058,7 @@ static sb32 syNetPeerHoldForPeer(void)
 			}
 			sSYNetPeerHoldStartUsecs = 0;
 			sSYNetPeerHoldStatusShown = FALSE;
+			sSYNetPeerPeerIsAway = FALSE;  // its input is flowing again (even if BACK was lost)
 		}
 		return FALSE;
 	}
@@ -1981,20 +2072,27 @@ static sb32 syNetPeerHoldForPeer(void)
 	{
 		sSYNetPeerHoldStartUsecs = now;
 		sSYNetPeerHoldLastSendUsecs = 0;
+		sSYNetPeerHoldBackCount = sSYNetPeerBackCount;
 		port_log("SSB64 NetPeer: holding for the peer (tick=%u highest_remote=%u)\n", syNetInputGetTick(),
 		         sSYNetPeerHighestRemoteTick);
+	}
+	if (sSYNetPeerHoldBackCount != sSYNetPeerBackCount)
+	{
+		sSYNetPeerHoldBackCount = sSYNetPeerBackCount;
+		sSYNetPeerHoldStartUsecs = now;  // back from another app: 30 s from now for its input
 	}
 	if (now - sSYNetPeerHoldLastSendUsecs >= 100000)
 	{
 		syNetPeerSendLocalInput();  // the peer may have missed our latest
 		sSYNetPeerHoldLastSendUsecs = now;
 	}
-	if ((sSYNetPeerHoldStatusShown == FALSE) && (now - sSYNetPeerHoldStartUsecs >= 1000000))
+	if ((now - sSYNetPeerHoldStartUsecs >= 1000000) &&
+		((sSYNetPeerHoldStatusShown == FALSE) || (sSYNetPeerAwayStatusShown != sSYNetPeerPeerIsAway)))
 	{
-		port_netplay_status("Online session", "Waiting for the other player...");
+		syNetPeerShowWaitStatus();
 		sSYNetPeerHoldStatusShown = TRUE;
 	}
-	if (now - sSYNetPeerHoldStartUsecs >= SYNETPEER_SESSION_LOCKSTEP_GIVEUP_USECS)
+	if (now - sSYNetPeerHoldStartUsecs >= syNetPeerGetGiveUpUsecs())
 	{
 		port_netplay_status(NULL, NULL);
 		sSYNetPeerHoldStartUsecs = 0;
@@ -2005,7 +2103,8 @@ static sb32 syNetPeerHoldForPeer(void)
 		}
 		else
 		{
-			port_log("SSB64 NetPeer: peer silent for 30 s; predicting from now on\n");
+			port_log("SSB64 NetPeer: peer silent for %u s; predicting from now on\n",
+			         (u32)(syNetPeerGetGiveUpUsecs() / 1000000));
 			sSYNetPeerLockstepIsEnabled = FALSE;
 		}
 		return FALSE;
@@ -2770,17 +2869,25 @@ void syNetPeerWaitForRemoteInput(u32 tick)
 	// only gives up after 30 s; elsewhere the old 5 s timeout applies.
 	const sb32 is_session_menu = (sSYNetPeerSessionIsActive != FALSE) && (syNetPeerSessionCheckInBattle() == FALSE);
 	sb32 is_status_shown = FALSE;
+	u32 back_count = sSYNetPeerBackCount;
 
 	while (syNetPeerCheckRemoteInputReady(tick) == FALSE)
 	{
 		if (is_session_menu != FALSE)
 		{
-			if ((is_status_shown == FALSE) && (waited_usecs >= 1000000))
+			if (back_count != sSYNetPeerBackCount)
 			{
-				port_netplay_status("Online session", "Waiting for the other player...");
+				back_count = sSYNetPeerBackCount;
+				sSYNetPeerStallUsecs += waited_usecs;
+				waited_usecs = 0;  // back from another app: 30 s from now for its input
+			}
+			if ((waited_usecs >= 1000000) &&
+				((is_status_shown == FALSE) || (sSYNetPeerAwayStatusShown != sSYNetPeerPeerIsAway)))
+			{
+				syNetPeerShowWaitStatus();
 				is_status_shown = TRUE;
 			}
-			if (waited_usecs >= SYNETPEER_SESSION_LOCKSTEP_GIVEUP_USECS)
+			if (waited_usecs >= syNetPeerGetGiveUpUsecs())
 			{
 				syNetPeerSessionEnd("the other player stopped responding");
 				break;

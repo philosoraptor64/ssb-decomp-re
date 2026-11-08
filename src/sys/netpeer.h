@@ -18,6 +18,8 @@ extern sb32 syNetPeerCheckActive(void);
 extern sb32 syNetPeerCheckRemoteInputReady(u32 tick);
 extern void syNetPeerRecordTickHash(void);
 extern sb32 syNetPeerTakeTimeSyncSkip(void);
+extern void syNetPeerSetLocalAway(sb32 is_away);
+extern sb32 syNetPeerTakeInjectStart(void);
 extern s32 syNetPeerGetControllerPort(s32 player);
 extern sb32 syNetPeerGetDebugBotInput(s32 player, u32 tick, u16 *buttons, s8 *stick_x, s8 *stick_y);
 // Host-set-up online matches (SSB64_NETPLAY_LOBBY=1).
