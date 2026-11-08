@@ -472,8 +472,19 @@ sb32 syNetPeerParseIPv4Address(const char *text, struct sockaddr_in *out_address
 	return TRUE;
 }
 
+#if defined(PORT) && !defined(_WIN32)
+// Voice chat (port/net/netplay_voice.cpp): rides the same socket, never
+// touches the simulation or its rollback state.
+extern void port_voice_pump(void);
+extern s32 port_voice_handle_packet(const u8 *data, s32 size);
+extern void port_voice_stop(void);
+#endif
+
 void syNetPeerCloseSocket(void)
 {
+#if defined(PORT) && !defined(_WIN32)
+	port_voice_stop();
+#endif
 	if (sSYNetPeerSocket >= 0)
 	{
 		close(sSYNetPeerSocket);
@@ -855,6 +866,10 @@ void syNetPeerHandleSessionDataPacket(const u8 *buffer, s32 size)
 
 void syNetPeerHandleBootstrapPacket(const u8 *buffer, s32 size)
 {
+	if (port_voice_handle_packet(buffer, size) != FALSE)
+	{
+		return;  // the peer already talks; we start once connected
+	}
 	if (size == SYNETPEER_CONTROL_PACKET_BYTES)
 	{
 		syNetPeerHandleControlPacket(buffer, size);
@@ -2105,6 +2120,10 @@ void syNetPeerHandlePacket(const u8 *buffer, s32 size)
 	s32 i;
 
 #if defined(PORT) && !defined(_WIN32)
+	if (port_voice_handle_packet(buffer, size) != FALSE)
+	{
+		return;
+	}
 	if (size == SYNETPEER_CONTROL_PACKET_BYTES)
 	{
 		syNetPeerHandleControlPacket(buffer, size);
@@ -2242,6 +2261,7 @@ void syNetPeerReceiveRemoteInput(void)
 	u8 buffer[SYNETPEER_PACKET_BYTES];
 
 	syNetPeerSimFlush();
+	port_voice_pump();
 
 	while (TRUE)
 	{
