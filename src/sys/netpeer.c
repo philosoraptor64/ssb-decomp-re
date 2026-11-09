@@ -1457,15 +1457,24 @@ void syNetPeerInitDebugEnv(void)
 	{
 		sSYNetPeerDebugBotIsEnabled = atoi(getenv("SSB64_NETPLAY_BOT"));
 	}
-	// SSB64_NETPLAY_ROLLBACK=1 predicts remote input and rolls back on a
-	// misprediction (port/rollback) instead of waiting for it every tick;
+	// Rollback (the default where snapshots work, i.e. Apple builds):
+	// predict remote input and roll back on a misprediction (port/rollback)
+	// instead of waiting for it every tick. SSB64_NETPLAY_ROLLBACK=0 forces
+	// lockstep; other platforms always use lockstep (the peers needn't match).
 	// SSB64_NETPLAY_ROLLBACK_WINDOW caps how far ahead of the peer we run.
+#if defined(PORT) && defined(__APPLE__) && defined(__clang__)
+	sSYNetPeerRollbackIsEnabled = TRUE;
+#else
 	sSYNetPeerRollbackIsEnabled = FALSE;
+#endif
 	sSYNetPeerRollbackWindow = 8;
-	if ((getenv("SSB64_NETPLAY_ROLLBACK") != NULL) && (atoi(getenv("SSB64_NETPLAY_ROLLBACK")) != 0))
+	if (getenv("SSB64_NETPLAY_ROLLBACK") != NULL)
 	{
-		sSYNetPeerRollbackIsEnabled = TRUE;
+#if defined(PORT) && defined(__APPLE__) && defined(__clang__)
+		sSYNetPeerRollbackIsEnabled = (atoi(getenv("SSB64_NETPLAY_ROLLBACK")) != 0) ? TRUE : FALSE;
+#endif
 	}
+	port_log("SSB64 NetPeer: %s\n", (sSYNetPeerRollbackIsEnabled != FALSE) ? "rollback (default)" : "lockstep");
 	if (getenv("SSB64_NETPLAY_ROLLBACK_WINDOW") != NULL)
 	{
 		sSYNetPeerRollbackWindow = (u32)atoi(getenv("SSB64_NETPLAY_ROLLBACK_WINDOW"));
