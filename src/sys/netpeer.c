@@ -24,6 +24,10 @@ extern void port_netplay_boot_wait(void);
 extern void port_netplay_status(const char *title, const char *text);
 extern void port_netplay_alert(const char *text);
 extern void port_netplay_rendezvous_bye(int sock);
+/* A host app's connection instead of our own socket (port/net/netplay_transport.cpp). */
+extern int port_net_external_active(void);
+extern int port_net_external_send(const unsigned char *data, unsigned int size);
+extern int port_net_external_recv(unsigned char *out, unsigned int cap);
 #endif
 #endif
 
@@ -511,6 +515,10 @@ sb32 syNetPeerOpenSocket(void)
 	{
 		return TRUE;
 	}
+	if (port_net_external_active() != 0)
+	{
+		return TRUE;  // the host app's connection (i64): no socket of our own
+	}
 	sSYNetPeerSocket = socket(AF_INET, SOCK_DGRAM, 0);
 
 	if (sSYNetPeerSocket < 0)
@@ -681,8 +689,30 @@ void syNetPeerApplyBootstrapMetadata(const SYNetInputReplayMetadata *metadata)
 #if defined(PORT) && !defined(_WIN32)
 void syNetPeerSendBytes(const u8 *buffer, u32 size)
 {
+	if (port_net_external_active() != 0)
+	{
+		port_net_external_send(buffer, size);
+		return;
+	}
 	sendto(sSYNetPeerSocket, buffer, size, 0,
 	       (struct sockaddr*)&sSYNetPeerPeerAddress, sizeof(sSYNetPeerPeerAddress));
+}
+
+// One datagram from the peer: its size, or -1 with errno EAGAIN when none waits.
+static ssize_t syNetPeerReceiveBytes(u8 *buffer, size_t capacity)
+{
+	if (port_net_external_active() != 0)
+	{
+		int size = port_net_external_recv(buffer, (unsigned int)capacity);
+
+		if (size < 0)
+		{
+			errno = EAGAIN;
+			return -1;
+		}
+		return size;
+	}
+	return recvfrom(sSYNetPeerSocket, buffer, capacity, 0, NULL, NULL);
 }
 #endif
 
@@ -913,7 +943,7 @@ void syNetPeerReceiveBootstrapPackets(void)
 
 	while (TRUE)
 	{
-		ssize_t size = recvfrom(sSYNetPeerSocket, buffer, sizeof(buffer), 0, NULL, NULL);
+		ssize_t size = syNetPeerReceiveBytes(buffer, sizeof(buffer));
 
 		if (size < 0)
 		{
@@ -1820,6 +1850,10 @@ sb32 syNetPeerSimSend(const u8 *buffer, u32 size)
 
 	if ((sSYNetPeerSimLossPercent == 0) && (sSYNetPeerSimLatencyUsecs == 0) && (sSYNetPeerSimJitterUsecs == 0))
 	{
+		if (port_net_external_active() != 0)
+		{
+			return (port_net_external_send(buffer, size) != 0) ? TRUE : FALSE;
+		}
 		return (sendto(sSYNetPeerSocket, buffer, size, 0, (struct sockaddr*)&sSYNetPeerPeerAddress,
 		               sizeof(sSYNetPeerPeerAddress)) == (ssize_t)size) ? TRUE : FALSE;
 	}
@@ -2092,7 +2126,7 @@ void syNetPeerSetLocalAway(sb32 is_away)
 #if defined(PORT) && !defined(_WIN32)
 	s32 i = 0;
 
-	if ((sSYNetPeerIsActive == FALSE) || (sSYNetPeerSocket < 0))
+	if ((sSYNetPeerIsActive == FALSE) || ((sSYNetPeerSocket < 0) && (port_net_external_active() == 0)))
 	{
 		return;
 	}
@@ -2593,7 +2627,7 @@ void syNetPeerReceiveRemoteInput(void)
 
 	while (TRUE)
 	{
-		ssize_t size = recvfrom(sSYNetPeerSocket, buffer, sizeof(buffer), 0, NULL, NULL);
+		ssize_t size = syNetPeerReceiveBytes(buffer, sizeof(buffer));
 
 		if (size < 0)
 		{
