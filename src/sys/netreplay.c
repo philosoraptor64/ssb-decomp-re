@@ -145,8 +145,13 @@ void syNetReplayApplyBattleMetadata(const SYNetInputReplayMetadata *metadata)
 			handicap = 9;
 		}
 
-		battle_state->players[player].player = (metadata->is_team_battle != FALSE) ? metadata->teams[player] : player;
-		battle_state->players[player].team = metadata->teams[player];
+		// a team outside red/blue/green (an older build's handshake) would make
+		// the character select read past its team tables and crash
+		s32 team = (metadata->teams[player] > nSCBattleTeamIDGreen) ?
+		           ((player < 2) ? nSCBattleTeamIDRed : nSCBattleTeamIDBlue) : metadata->teams[player];
+
+		battle_state->players[player].player = (metadata->is_team_battle != FALSE) ? team : player;
+		battle_state->players[player].team = team;
 		battle_state->players[player].pkind = metadata->player_kinds[player];
 		battle_state->players[player].fkind = metadata->fighter_kinds[player];
 		battle_state->players[player].costume = metadata->costumes[player];
@@ -159,13 +164,13 @@ void syNetReplayApplyBattleMetadata(const SYNetInputReplayMetadata *metadata)
 		if (metadata->player_kinds[player] == nFTPlayerKindMan)
 		{
 			battle_state->players[player].color =
-			(metadata->is_team_battle == FALSE) ? player : dIFCommonPlayerTeamColorIDs[metadata->teams[player]];
+			(metadata->is_team_battle == FALSE) ? player : dIFCommonPlayerTeamColorIDs[team];
 			battle_state->pl_count++;
 		}
 		else if (metadata->player_kinds[player] == nFTPlayerKindCom)
 		{
 			battle_state->players[player].color =
-			(metadata->is_team_battle == FALSE) ? GMCOMMON_PLAYERS_MAX : dIFCommonPlayerTeamColorIDs[metadata->teams[player]];
+			(metadata->is_team_battle == FALSE) ? GMCOMMON_PLAYERS_MAX : dIFCommonPlayerTeamColorIDs[team];
 			battle_state->cp_count++;
 		}
 	}

@@ -640,7 +640,9 @@ void syNetPeerMakeBootstrapMetadata(SYNetInputReplayMetadata *metadata)
 		metadata->player_kinds[player] = nFTPlayerKindNot;
 		metadata->fighter_kinds[player] = nFTKindNull;
 		metadata->costumes[player] = 0;
-		metadata->teams[player] = player;
+		// the VS menu's own defaults (red, red, blue, blue): only red, blue
+		// and green exist, and the character select indexes tables with it
+		metadata->teams[player] = (player < 2) ? nSCBattleTeamIDRed : nSCBattleTeamIDBlue;
 		metadata->handicaps[player] = 9;
 		metadata->levels[player] = 3;
 		metadata->shades[player] = 0;
