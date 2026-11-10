@@ -1905,12 +1905,16 @@ static uint64_t syNetPeerNetNow(void)
 	return syNetPeerSimNowUsecs();
 }
 
+// -1 = not set yet for this connection, 0 = menu delay, 1 = battle delay
+static s32 sSYNetPeerDelayMode = -1;
+
 // A new connection (VS match or online session) starts at the current tick.
 static void syNetPeerNetCreate(void)
 {
 	n64net_input_config config;
 
 	syNetPeerNetDestroy();
+	sSYNetPeerDelayMode = -1;
 	memset(&config, 0, sizeof(config));
 	config.num_players = MAXCONTROLLERS;
 	config.local_player = sSYNetPeerLocalPlayer;
@@ -1942,6 +1946,43 @@ static void syNetPeerNetSyncWindow(void)
 	                   ((sSYNetPeerSessionIsActive == FALSE) || (syNetPeerSessionCheckInBattle() != FALSE));
 
 	n64net_input_set_window(sSYNetPeerNet, (is_rollback != FALSE) ? sSYNetPeerRollbackWindow : 0);
+
+	// Menus (lockstep) wait for the friend's input every frame: on a slow
+	// link (cellular, ~80 ms round trips) a 2-frame delay stalls almost every
+	// frame and the audio stutters. There, the delay follows the measured
+	// round trip (up to SSB64_NETPLAY_MENU_MAX_DELAY, default 6 = 100 ms; a
+	// little menu lag nobody notices); battles keep the fixed short delay
+	// (rollback hides the rest). Both sides switch at the same scene change.
+	if (sSYNetPeerSessionIsActive != FALSE)
+	{
+		s32 mode = (is_rollback != FALSE) ? 1 : 0;
+
+		if (mode != sSYNetPeerDelayMode)
+		{
+			u32 menu_max = 6;
+
+			if (getenv("SSB64_NETPLAY_MENU_MAX_DELAY") != NULL)
+			{
+				menu_max = (u32)atoi(getenv("SSB64_NETPLAY_MENU_MAX_DELAY"));
+			}
+			if (menu_max < sSYNetPeerInputDelay)
+			{
+				menu_max = sSYNetPeerInputDelay;
+			}
+			if (mode == 0)
+			{
+				n64net_input_set_auto_delay(sSYNetPeerNet, sSYNetPeerInputDelay, menu_max);
+			}
+			else
+			{
+				n64net_input_set_auto_delay(sSYNetPeerNet, sSYNetPeerInputDelay, 0);  // off
+				n64net_input_set_delay(sSYNetPeerNet, sSYNetPeerInputDelay);
+			}
+			port_log("SSB64 NetPeer: %s input delay at tick %u (%s)\n", (mode == 0) ? "menu" : "battle",
+			         syNetInputGetTick(), (mode == 0) ? "follows the round trip" : "fixed");
+			sSYNetPeerDelayMode = mode;
+		}
+	}
 }
 
 void *syNetPeerGetNet(void)
