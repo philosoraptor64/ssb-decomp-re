@@ -1552,7 +1552,8 @@ void syNetPeerInitDebugEnv(void)
 
 	sSYNetPeerSessionIsEnabled = (getenv("SSB64_NETPLAY_MODE") != NULL) &&
 	                             (syNetPeerStringEquals(getenv("SSB64_NETPLAY_MODE"), "session") != FALSE) &&
-	                             (sSYNetPeerUseRendezvous != FALSE);
+	                             // a room-server connection, or a host app's game channel (i64)
+	                             ((sSYNetPeerUseRendezvous != FALSE) || (port_net_external_active() != 0));
 	if (sSYNetPeerSessionIsEnabled != FALSE)
 	{
 		struct timespec ts;
