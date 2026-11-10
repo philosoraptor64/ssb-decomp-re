@@ -122,7 +122,7 @@ void syNetReplayApplyBattleMetadata(const SYNetInputReplayMetadata *metadata)
 	battle_state->stocks = metadata->stocks;
 	battle_state->handicap = metadata->handicap;
 	battle_state->is_team_attack = metadata->is_team_attack;
-	battle_state->is_stage_select = FALSE;
+	battle_state->is_stage_select = metadata->is_stage_select;  // the host's VS option (stage select or random)
 	battle_state->damage_ratio = metadata->damage_ratio;
 	battle_state->item_toggles = metadata->item_toggles;
 	battle_state->item_appearance_rate = metadata->item_appearance_rate;

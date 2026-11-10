@@ -1595,6 +1595,7 @@ void syNetPeerInitDebugEnv(void)
 			sSYNetPeerBootstrapMetadata.is_team_attack = rules.is_team_attack;
 			sSYNetPeerBootstrapMetadata.damage_ratio = rules.damage_ratio;
 			sSYNetPeerBootstrapMetadata.item_appearance_rate = rules.item_appearance_rate;
+			sSYNetPeerBootstrapMetadata.is_stage_select = rules.is_stage_select;  // else every battle got a random stage
 			clock_gettime(CLOCK_REALTIME, &ts);
 			sSYNetPeerBootstrapMetadata.rng_seed = (u32)ts.tv_sec ^ (u32)ts.tv_nsec;
 			sSYNetPeerLobbyHasMetadata = TRUE;
