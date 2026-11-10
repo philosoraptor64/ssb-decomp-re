@@ -2205,6 +2205,26 @@ void syNetPeerSetLocalAway(sb32 is_away)
 #endif
 }
 
+// The host app (i64) paused or resumed the whole game on both machines: both
+// sides say "away" while paused, so neither gives up on the other's silence
+// afterwards; on resume, only the side whose player paused presses Start (in
+// a running VS battle that opens the pause menu; in menus nothing is pressed
+// and the game simply carries on).
+extern u64 sSYNetPeerHoldStartUsecs;
+
+void syNetPeerHostPause(sb32 is_paused, sb32 is_initiator)
+{
+	syNetPeerSetLocalAway(is_paused);
+	if (is_paused == FALSE)
+	{
+		sSYNetPeerHoldStartUsecs = 0;  // a wait in progress starts its count again
+		if (is_initiator == FALSE)
+		{
+			sSYNetPeerInjectStart = FALSE;
+		}
+	}
+}
+
 // netinput, sampling the local controller: TRUE once after coming back, if
 // a VS battle is running unpaused (the press opens the pause menu).
 sb32 syNetPeerTakeInjectStart(void)
