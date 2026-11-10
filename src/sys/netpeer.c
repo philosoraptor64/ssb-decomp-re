@@ -7,6 +7,7 @@
 #include <sys/netreplay.h>
 #include <sys/netsync.h>
 #include <sys/utils.h>
+#include <mn/menu.h>
 
 #ifdef PORT
 extern char *getenv(const char *name);
@@ -1095,7 +1096,7 @@ sb32 syNetPeerSessionCheckInBattle(void)
 	return (gSCManagerSceneData.scene_curr == nSCKindVSBattle) ? TRUE : FALSE;
 }
 
-// After a successful handshake: start the session in the VS menu.
+// After a successful handshake: start the session at the title screen.
 void syNetPeerSessionBegin(void)
 {
 	s32 player;
@@ -1128,8 +1129,19 @@ void syNetPeerSessionBegin(void)
 	sSYNetPeerSessionRandom = sSYNetPeerBootstrapMetadata.rng_seed;
 	sSYNetPeerSessionIsActive = TRUE;
 
-	gSCManagerSceneData.scene_prev = nSCKindTitle;
-	gSCManagerSceneData.scene_curr = nSCKindVSMode;
+	// The whole game as one console: from the title screen (every mode,
+	// menus in lockstep). SSB64_NETPLAY_SESSION_FROM=vs starts in the VS menu.
+	if ((getenv("SSB64_NETPLAY_SESSION_FROM") != NULL) &&
+		(syNetPeerStringEquals(getenv("SSB64_NETPLAY_SESSION_FROM"), "vs") != FALSE))
+	{
+		gSCManagerSceneData.scene_prev = nSCKindTitle;
+		gSCManagerSceneData.scene_curr = nSCKindVSMode;
+	}
+	else
+	{
+		gSCManagerSceneData.scene_prev = nSCKindStartup;
+		gSCManagerSceneData.scene_curr = nSCKindTitle;
+	}
 	if (getenv("SSB64_NETPLAY_SESSION_START_SCENE") != NULL)
 	{
 		// Unattended tests: start the session somewhere else (e.g. 22 = a VS
@@ -2945,6 +2957,143 @@ s32 syNetPeerGetControllerPort(s32 player)
 	return (syNetPeerCheckLocalPlayer(player) != FALSE) ? 0 : player;
 }
 
+// SSB64_NETPLAY_BOT=5 plays the whole game with intent (session tests):
+// the host's bot drives the shared menus (title -> main menu -> VS mode ->
+// VS start), each bot steers its own puck onto a fighter on the character
+// select (a different one every visit), the host starts, picks the stage
+// and continues from the results; in battles both fight like bot 1. Any
+// other scene is backed out of with B. Reads menu state only (no writes).
+extern s32 sMNModeSelectOption;
+extern s32 sMNVSModeCursorIndex;
+extern MNPlayersSlotVS sMNPlayersVSSlots[GMCOMMON_PLAYERS_MAX];
+extern sb32 mnPlayersVSCheckReady(void);
+
+static sb32 syNetPeerPlayBotMenuStep(s32 current, s32 want, u32 tick, u16 *buttons)
+{
+	// one tap per 8 ticks (menus ignore held buttons until auto-repeat)
+	if ((tick % 8) != 0)
+	{
+		return FALSE;
+	}
+	if (current < want) *buttons = D_JPAD;
+	else if (current > want) *buttons = U_JPAD;
+	else *buttons = A_BUTTON;
+	return TRUE;
+}
+
+static s8 syNetPeerPlayBotSteer(f32 delta)
+{
+	f32 v = delta * 2.5F;
+
+	if (v > 70.0F) v = 70.0F;
+	if (v < -70.0F) v = -70.0F;
+	if ((v > 0.0F) && (v < 22.0F)) v = 22.0F;   // past the cursor's dead zone
+	if ((v < 0.0F) && (v > -22.0F)) v = -22.0F;
+	return (s8)v;
+}
+
+static sb32 syNetPeerGetPlayBotInput(s32 player, u32 tick, u16 *buttons, s8 *stick_x, s8 *stick_y)
+{
+	static u32 scene_seen = 0xFFFFFFFF, scene_since = 0, css_visits = 0;
+	sb32 is_host = (sSYNetPeerBootstrapIsHost != FALSE) ? TRUE : FALSE;
+	u32 scene = gSCManagerSceneData.scene_curr;
+	u32 in_scene;
+
+	*buttons = 0;
+	*stick_x = 0;
+	*stick_y = 0;
+	if (scene_seen != scene)
+	{
+		scene_seen = scene;
+		scene_since = tick;
+		if (scene == nSCKindPlayersVS)
+		{
+			css_visits++;
+		}
+	}
+	in_scene = tick - scene_since;
+	if (in_scene < 45)
+	{
+		return TRUE;  // let each screen settle (fades, "press start" waits)
+	}
+	switch (scene)
+	{
+	case nSCKindVSBattle:
+		return FALSE;  // fight like bot 1 (the caller's default)
+
+	case nSCKindTitle:
+		if (is_host && ((tick % 30) == 0)) *buttons = START_BUTTON;
+		return TRUE;
+
+	case nSCKindModeSelect:
+		if (is_host) syNetPeerPlayBotMenuStep(sMNModeSelectOption, nMNModeSelectOptionVSMode, tick, buttons);
+		return TRUE;
+
+	case nSCKindVSMode:
+		if (is_host) syNetPeerPlayBotMenuStep(sMNVSModeCursorIndex, nMNVSModeOptionStart, tick, buttons);
+		return TRUE;
+
+	case nSCKindPlayersVS:
+	{
+		MNPlayersSlotVS *slot = &sMNPlayersVSSlots[player];
+
+		if (slot->is_fighter_selected == FALSE)
+		{
+			// a different fighter each visit, per player: one of the 8 starters
+			s32 portrait = (s32)((css_visits * 3 + (u32)player * 5) % 8);
+			s32 col = (portrait < 4) ? portrait + 1 : portrait - 3;   // middle columns: always unlocked
+			s32 row = (portrait < 4) ? 0 : 1;
+			f32 want_x = (f32)(25 + col * 45 + 22 - 13);
+			f32 want_y = (f32)((row == 0 ? 57 : 100) - 12);
+			SObj *target;
+
+			if ((slot->cursor_status == nMNPlayersCursorStatusGrab) && (slot->puck != NULL))
+			{
+				target = SObjGetStruct(slot->puck);
+			}
+			else if (slot->puck != NULL && slot->cursor != NULL)
+			{
+				// not holding it: go and pick the puck up
+				SObj *puck = SObjGetStruct(slot->puck);
+
+				want_x = puck->pos.x;
+				want_y = puck->pos.y;
+				target = SObjGetStruct(slot->cursor);
+			}
+			else return TRUE;
+
+			if ((target->pos.x - want_x) * (target->pos.x - want_x) + (target->pos.y - want_y) * (target->pos.y - want_y) > 36.0F)
+			{
+				*stick_x = syNetPeerPlayBotSteer(want_x - target->pos.x);
+				*stick_y = syNetPeerPlayBotSteer(target->pos.y - want_y);  // screen y grows downwards
+			}
+			else if ((tick % 10) == 0)
+			{
+				*buttons = A_BUTTON;
+			}
+		}
+		else if (is_host && (mnPlayersVSCheckReady() != FALSE) && ((tick % 30) == 0))
+		{
+			*buttons = START_BUTTON;
+		}
+		return TRUE;
+	}
+	case nSCKindMaps:
+		if (is_host && (in_scene > 120) && ((tick % 30) == 0)) *buttons = A_BUTTON;
+		return TRUE;
+
+	case nSCKindVSResults:  // continues on START only
+		if (is_host && (in_scene > 300) && ((tick % 30) == 0)) *buttons = START_BUTTON;
+		return TRUE;
+
+	default:
+		// anything else: back out (both, in case it's a per-player screen)
+		if ((tick % 20) == 0) *buttons = B_BUTTON;
+		if ((in_scene > 600) && ((tick % 40) == 20)) *buttons = START_BUTTON;
+		return TRUE;
+	}
+}
+
 // Debug bot: deterministic pseudo-random input for the local netplay player,
 // a pure function of (player, tick). Each choice is held for 12 ticks, with
 // buttons pressed only for the first 3 so attacks re-trigger. Never START.
@@ -2965,6 +3114,10 @@ sb32 syNetPeerGetDebugBotInput(s32 player, u32 tick, u16 *buttons, s8 *stick_x, 
 		*buttons = 0;
 		return TRUE;
 	}
+	if ((sSYNetPeerDebugBotIsEnabled == 5) && (syNetPeerGetPlayBotInput(player, tick, buttons, stick_x, stick_y) != FALSE))
+	{
+		return TRUE;
+	}
 	if (sSYNetPeerDebugBotIsEnabled == 2)
 	{
 		*stick_x = 80;
@@ -2977,6 +3130,71 @@ sb32 syNetPeerGetDebugBotInput(s32 player, u32 tick, u16 *buttons, s8 *stick_x, 
 	h ^= h >> 15;
 	h *= 0x85EBCA6BU;
 	h ^= h >> 13;
+
+	// SSB64_NETPLAY_BOT=4 explores the whole game in a session: outside VS
+	// battles it moves menu cursors (stick held for a while), presses A often,
+	// B sometimes (back out) and START now and then (title, pauses); inside
+	// battles it fights like 1 with an occasional pause. It never presses A
+	// in the Options menu, so tests can't reach "clear save data", and backs
+	// out of any menu it has been in for 15 s.
+	if (sSYNetPeerDebugBotIsEnabled == 4)
+	{
+		// Local test input only (it is sent like a player's), so this state
+		// needn't be shared: after 15 s in one menu, back out with B.
+		static u32 scene_seen = 0xFFFFFFFF, scene_since = 0;
+		u32 r = (h >> 16) % 32;
+		sb32 in_menu = (gSCManagerSceneData.scene_curr != nSCKindVSBattle) ? TRUE : FALSE;
+
+		if (scene_seen != gSCManagerSceneData.scene_curr)
+		{
+			scene_seen = gSCManagerSceneData.scene_curr;
+			scene_since = tick;
+		}
+		if ((in_menu != FALSE) && ((tick - scene_since) > 900))
+		{
+			*stick_x = 0;
+			*stick_y = 0;
+			*buttons = ((tick % 12) < 2) ? B_BUTTON : 0;
+			return TRUE;
+		}
+
+		*stick_x = sticks[h % 6];
+		*stick_y = (((h >> 8) % 4) == 0) ? 80 : ((((h >> 8) % 4) == 1) ? -80 : 0);
+		*buttons = 0;
+		if (in_menu != FALSE)
+		{
+			if ((tick % 12) >= 6)
+			{
+				*stick_x = 0;  // let go between moves, so cursors step instead of sliding off
+				*stick_y = 0;
+			}
+			if ((tick % 12) < 2)
+			{
+				if (r < 14)
+				{
+					*buttons = (gSCManagerSceneData.scene_curr == nSCKindOption) ? B_BUTTON : A_BUTTON;
+				}
+				else if (r < 18) *buttons = B_BUTTON;
+				else if (r < 20) *buttons = START_BUTTON;
+			}
+			return TRUE;
+		}
+		if ((tick % 12) < 3)
+		{
+			switch ((h >> 16) % 40)
+			{
+			case 0: *buttons = START_BUTTON; break;
+			case 1: case 2: case 3: case 4: case 5: case 6: case 7: case 8: case 9: case 10: case 11: case 12:
+				*buttons = A_BUTTON;
+				break;
+			case 13: case 14: case 15: case 16: case 17: case 18: case 19: case 20: *buttons = B_BUTTON; break;
+			case 21: case 22: case 23: case 24: *buttons = Z_TRIG; break;
+			case 25: case 26: case 27: case 28: *buttons = U_CBUTTONS; break;
+			default: break;
+			}
+		}
+		return TRUE;
+	}
 
 	*stick_x = sticks[h % 6];
 	*stick_y = (((h >> 8) % 8) == 0) ? 80 : ((((h >> 8) % 8) == 1) ? -80 : 0);
