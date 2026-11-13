@@ -27,6 +27,7 @@ extern void port_netplay_alert(const char *text);
 extern void port_netplay_rendezvous_bye(int sock);
 /* A host app's connection instead of our own socket (port/net/netplay_transport.cpp). */
 extern int port_net_external_active(void);
+extern void port_net_set_end_reason(const char *why);   // port/net/netplay_transport.cpp (inside i64)
 extern int port_net_external_send(const unsigned char *data, unsigned int size);
 extern int port_net_external_recv(unsigned char *out, unsigned int cap);
 #endif
@@ -1163,6 +1164,28 @@ void syNetPeerSessionBegin(void)
 }
 
 // The session ends (the peer is gone): both games carry on offline.
+// (the decomp's string.h has no strstr)
+static sb32 syNetPeerTextHas(const char *text, const char *word)
+{
+	s32 i, j;
+
+	if (text == NULL)
+	{
+		return FALSE;
+	}
+	for (i = 0; text[i] != 0; i++)
+	{
+		for (j = 0; (word[j] != 0) && (text[i + j] == word[j]); j++)
+		{
+		}
+		if (word[j] == 0)
+		{
+			return TRUE;
+		}
+	}
+	return FALSE;
+}
+
 void syNetPeerSessionEnd(const char *reason)
 {
 	s32 player;
@@ -1172,6 +1195,9 @@ void syNetPeerSessionEnd(const char *reason)
 		return;
 	}
 	port_log("SSB64 NetPeer: session ended: %s\n", reason);
+	port_net_set_end_reason(syNetPeerTextHas(reason, "left")
+	                            ? "Your friend left the game."
+	                            : "Lost the connection to your friend, so the match was stopped.");
 	sSYNetPeerSessionIsActive = FALSE;
 	sSYNetPeerIsActive = FALSE;
 	sSYNetPeerRollbackIsEnabled = FALSE;
@@ -1216,7 +1242,8 @@ void syNetPeerSessionFuncRead(void)
 {
 	// Test hook: SSB64_NETPLAY_TEST_DESYNC=<tick> on one machine nudges its
 	// session RNG at that tick, to check that the desync alert fires.
-	if ((getenv("SSB64_NETPLAY_TEST_DESYNC") != NULL) && (syNetInputGetTick() == (u32)atoi(getenv("SSB64_NETPLAY_TEST_DESYNC"))))
+	if ((getenv("SSB64_NETPLAY_TEST_DESYNC") != NULL) && (sSYNetPeerBootstrapIsHost != FALSE) &&
+	    (syNetInputGetTick() == (u32)atoi(getenv("SSB64_NETPLAY_TEST_DESYNC"))))   // host only (a pair test sets it on both)
 	{
 		sSYNetPeerSessionRandom++;
 	}
@@ -2437,6 +2464,7 @@ static void syNetPeerSyncCheckCompare(u32 tick, u32 kind, u32 local_hash, u32 re
 	sSYNetPeerDesyncReported = TRUE;
 	port_log("SSB64 NetPeer: DESYNC detected tick=%u kind=%s local=%08X remote=%08X (after %u matching checks)\n",
 	         tick, (kind == 0) ? "session" : "battle", local_hash, remote_hash, sSYNetPeerSyncChecksMatched);
+	port_net_set_end_reason("The two games got out of step, so the match was stopped. (Both logs have the details.)");
 	port_netplay_alert("The two games have gone out of sync, so what you see may now differ from your "
 	                   "friend's screen. This is a bug: please send both players' logs (Files > BattleShip > ssb64.log).");
 }
@@ -2726,6 +2754,7 @@ void syNetPeerReceiveRemoteInput(void)
 			sSYNetPeerDesyncReported = TRUE;
 			port_log("SSB64 NetPeer: DESYNC detected tick=%u kind=%s (after %u matching checks)\n", tick,
 			         (kind == 0) ? "session" : "battle", n64net_sync_matched(sSYNetPeerNet));
+			port_net_set_end_reason("The two games got out of step, so the match was stopped. (Both logs have the details.)");
 			port_netplay_alert("The two games have gone out of sync, so what you see may now differ from your "
 			                   "friend's screen. This is a bug: please send both players' logs (Files > BattleShip > ssb64.log).");
 		}
