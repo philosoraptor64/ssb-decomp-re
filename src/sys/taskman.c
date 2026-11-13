@@ -1347,6 +1347,8 @@ void syTaskmanStartTask(SYTaskmanSetup *tsetup)
 		extern void port_dl_range_register(const void *base, size_t size, const char *label);
 		extern void port_dl_range_unregister(const void *base);
 		extern void port_taskman_evict_arena_caches(const void *base, size_t size);
+		extern void *port_scene_heap_alloc(size_t size);
+		extern void port_scene_heap_free(void *p, size_t size);
 
 		/* SSB64_SCENE_HEAP_FREE=1 — sanitizer diagnostic mode. Instead of
 		 * recycling the singleton arena, free() it and malloc() a fresh one
@@ -1373,13 +1375,13 @@ void syTaskmanStartTask(SYTaskmanSetup *tsetup)
 			if (sPortSceneHeapFreeMode)
 			{
 				port_dl_range_unregister(gPortSceneHeap);
-				free(gPortSceneHeap);
+				port_scene_heap_free(gPortSceneHeap, gPortSceneHeapSize);
 				gPortSceneHeap = NULL;
 			}
 		}
 		if (gPortSceneHeap == NULL)
 		{
-			gPortSceneHeap = malloc(gPortSceneHeapSize);
+			gPortSceneHeap = port_scene_heap_alloc(gPortSceneHeapSize); /* port/scene_heap.cpp (i64: the arena) */
 			if (gPortSceneHeap == NULL)
 			{
 				port_log("SSB64: syTaskmanStartTask — failed to allocate PORT heap size=0x%llx\n",
