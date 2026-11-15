@@ -52,9 +52,38 @@ void lbBackupWrite(void)
     syDmaWriteSram(&gSCManagerBackupData, ALIGN(sizeof(LBBackupData), 0x10), sizeof(LBBackupData));
 }
 
+#ifdef PORT
+// i64's "everything unlocked" (port/i64_module.cpp): every character, Mushroom Kingdom, the item switch and the
+// sound test, on a save of its own (the module points the save file elsewhere for such a run)
+extern int port_unlock_all_active(void);
+extern void port_log(const char *fmt, ...);
+sb32 lbBackupIsSramValidRead(void);
+static void lbBackupApplyUnlockAll(void)
+{
+    if (port_unlock_all_active() == 0)
+    {
+        return;
+    }
+    gSCManagerBackupData.unlock_mask |= LBBACKUP_UNLOCK_MASK_ALL;
+    gSCManagerBackupData.fighter_mask |= LBBACKUP_CHARACTER_MASK_ALL;
+    port_log("SSB64: everything unlocked (unlock mask 0x%02X, fighters 0x%04X)\n", gSCManagerBackupData.unlock_mask,
+             gSCManagerBackupData.fighter_mask);
+}
+#endif
+
 // 0x800D4644
 sb32 lbBackupIsSramValid(void)
 {
+#ifdef PORT
+    sb32 valid = lbBackupIsSramValidRead();
+
+    lbBackupApplyUnlockAll();
+    return valid;
+}
+
+sb32 lbBackupIsSramValidRead(void)
+{
+#endif
     syDmaReadSram(ALIGN(sizeof(LBBackupData), 0x0), &gSCManagerBackupData, sizeof(LBBackupData));
 
     if (lbBackupIsChecksumValid() == FALSE)
