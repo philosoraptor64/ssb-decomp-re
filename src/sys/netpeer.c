@@ -1,6 +1,7 @@
 #include <sys/netpeer.h>
 
 #include <ft/fighter.h>
+#include <ft/ftcomputer.h>
 #include <gr/ground.h>
 #include <sc/scmanager.h>
 #include <sys/netinput.h>
@@ -3147,6 +3148,74 @@ s32 syNetPeerGetFirstLocalPlayer(void)
 s32 syNetPeerGetControllerPort(s32 player)
 {
 	return (syNetPeerCheckLocalPlayer(player) != FALSE) ? sSYNetPeerPadOf[player] : player;
+}
+
+// A device left a session of more than two (i64's drop-out menu), "a CPU takes over": from the agreed tick
+// the player's fighter is the game's own computer player at that level (1-9), on every device and in
+// rollback replays (the change is part of the simulation). Outside a battle, the next battle starts it as a
+// CPU (the host can change the character select slot as usual).
+s32 syNetPeerDropoutCpu(s32 player, s32 level)
+{
+#if defined(PORT) && !defined(_WIN32)
+	uint8_t action[2];
+	uint32_t apply = 0;
+
+	action[0] = 1;   // N64_DROPOUT_CPU
+	action[1] = (uint8_t)(((level >= 1) && (level <= 9)) ? level : 5);
+	if ((sSYNetPeerNet == NULL) || (n64net_input_retire(sSYNetPeerNet, player, action, sizeof(action), &apply) == 0))
+	{
+		return 1;
+	}
+	port_log("SSB64 NetPeer: player %d left; a level %d CPU from tick %u\n", player + 1, action[1], apply);
+	return 0;
+#else
+	return 1;
+#endif
+}
+
+// Every simulated tick (also in replays): a departed player becomes a CPU at the agreed tick.
+void syNetPeerApplyRetirements(u32 tick)
+{
+#if defined(PORT) && !defined(_WIN32)
+	s32 player;
+
+	if (sSYNetPeerNet == NULL)
+	{
+		return;
+	}
+	for (player = 0; player < MAXCONTROLLERS; player++)
+	{
+		uint32_t last, apply, size = 2;
+		uint8_t action[N64NET_INPUT_MAX_EVENT];
+
+		if (!n64net_input_retired(sSYNetPeerNet, player, &last, &apply, action, &size) || (tick != apply) ||
+			(size < 2) || (action[0] != 1))
+		{
+			continue;
+		}
+		gSCManagerTransferBattleState.players[player].pkind = nFTPlayerKindCom;
+		gSCManagerTransferBattleState.players[player].level = action[1];
+		if ((syNetPeerSessionCheckInBattle() != FALSE) && (gSCManagerBattleState != NULL) &&
+			(gSCManagerBattleState->players[player].fighter_gobj != NULL))
+		{
+			GObj *fighter_gobj = gSCManagerBattleState->players[player].fighter_gobj;
+			FTStruct *fp = ftGetStruct(fighter_gobj);
+
+			gSCManagerBattleState->players[player].pkind = nFTPlayerKindCom;
+			gSCManagerBattleState->players[player].level = action[1];
+			if (fp->pkind == nFTPlayerKindMan)
+			{
+				fp->pkind = nFTPlayerKindCom;
+				fp->level = action[1];
+				ftComputerSetupAll(fighter_gobj);
+			}
+		}
+		if (syNetInputCheckResimulating() == FALSE)
+		{
+			port_log("SSB64 NetPeer: tick %u: player %d is a level %u CPU now\n", tick, player + 1, action[1]);
+		}
+	}
+#endif
 }
 
 // A device left a session of more than two (i64's drop-out menu): its player stays in, with nothing

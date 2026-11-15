@@ -12,6 +12,7 @@ extern void port_log(const char *fmt, ...);
 // come from the shared n64net library instead of the histories below.
 extern void *syNetPeerGetNet(void);
 extern s32 syNetPeerGetFirstLocalPlayer(void);
+extern void syNetPeerApplyRetirements(u32 tick);
 #define SYNETINPUT_NET() ((n64net_input *)syNetPeerGetNet())
 #else
 #define SYNETINPUT_NET() NULL
@@ -846,6 +847,7 @@ void syNetInputFuncRead(void)
 	{
 		syNetPeerWaitForRemoteInput(tick);
 	}
+	syNetPeerApplyRetirements(tick);   // a departed player's CPU takes over (agreed tick, replays too)
 
 	for (player = 0; player < MAXCONTROLLERS; player++)
 	{
