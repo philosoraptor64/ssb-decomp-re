@@ -30,6 +30,7 @@ extern int port_net_external_active(void);
 extern void port_net_set_end_reason(const char *why);   // port/net/netplay_transport.cpp (inside i64)
 extern int port_net_external_send(const unsigned char *data, unsigned int size);
 extern int port_net_external_recv(unsigned char *out, unsigned int cap);
+extern int port_net_external_recv_from(unsigned char *out, unsigned int cap, int *machine);
 #endif
 #endif
 
@@ -119,6 +120,15 @@ sb32 sSYNetPeerIsConfigured;
 sb32 sSYNetPeerIsActive;
 s32 sSYNetPeerLocalPlayer;
 s32 sSYNetPeerRemotePlayer;
+// Up to 4 players over up to 4 devices (i64 ABI v2): this device's players and the others' (bit = port);
+// LocalPlayer/RemotePlayer stay the first of each (two-player code and logs). PadOf: the controller (0-3)
+// of each local player on this device.
+u32 sSYNetPeerLocalMask;
+u32 sSYNetPeerRemoteMask;
+s32 sSYNetPeerPadOf[MAXCONTROLLERS];
+s32 sSYNetPeerMachines;
+u32 sSYNetPeerReadyFrom;     // the host: guest devices that said READY (bit = device)
+s32 sSYNetPeerLastSender;    // the device the last received packet came from (-1 = unknown)
 u32 sSYNetPeerInputDelay;
 u32 sSYNetPeerSessionID;
 u32 sSYNetPeerHighestRemoteTick;
@@ -707,7 +717,10 @@ static ssize_t syNetPeerReceiveBytes(u8 *buffer, size_t capacity)
 {
 	if (port_net_external_active() != 0)
 	{
-		int size = port_net_external_recv(buffer, (unsigned int)capacity);
+		int machine = -1;
+		int size = port_net_external_recv_from(buffer, (unsigned int)capacity, &machine);
+
+		sSYNetPeerLastSender = machine;
 
 		if (size < 0)
 		{
@@ -786,7 +799,19 @@ void syNetPeerHandleControlPacket(const u8 *buffer, s32 size)
 	}
 	if (packet_type == SYNETPEER_PACKET_READY)
 	{
-		sSYNetPeerBootstrapPeerReady = TRUE;
+		// every guest device (more than two: by sender; an unknown sender counts as all)
+		if ((sSYNetPeerMachines <= 2) || (sSYNetPeerLastSender < 0))
+		{
+			sSYNetPeerBootstrapPeerReady = TRUE;
+		}
+		else
+		{
+			sSYNetPeerReadyFrom |= 1u << (sSYNetPeerLastSender & 31);
+			if (__builtin_popcount(sSYNetPeerReadyFrom) >= sSYNetPeerMachines - 1)
+			{
+				sSYNetPeerBootstrapPeerReady = TRUE;
+			}
+		}
 	}
 	else if (packet_type == SYNETPEER_PACKET_START)
 	{
@@ -1118,8 +1143,11 @@ void syNetPeerSessionBegin(void)
 	{
 		syNetInputSetSlotSource(player, nSYNetInputSourceSaved);  // neutral unless a player below
 	}
-	syNetInputSetSlotSource(sSYNetPeerLocalPlayer, nSYNetInputSourceLocal);
-	syNetInputSetSlotSource(sSYNetPeerRemotePlayer, nSYNetInputSourceRemotePredicted);
+	for (player = 0; player < MAXCONTROLLERS; player++)
+	{
+		if (sSYNetPeerLocalMask & (1u << player)) syNetInputSetSlotSource(player, nSYNetInputSourceLocal);
+		if (sSYNetPeerRemoteMask & (1u << player)) syNetInputSetSlotSource(player, nSYNetInputSourceRemotePredicted);
+	}
 	syNetInputSetLocalInputDelay(sSYNetPeerInputDelay);
 	syNetPeerResetSessionCounters();
 	syNetPeerSyncCheckReset();
@@ -1419,6 +1447,19 @@ void syNetPeerInitDebugEnv(void)
 	sSYNetPeerSimJitterUsecs = 0;
 	sSYNetPeerLocalPlayer = 0;
 	sSYNetPeerRemotePlayer = 1;
+	sSYNetPeerLocalMask = 0;
+	sSYNetPeerRemoteMask = 0;
+	sSYNetPeerMachines = 2;
+	sSYNetPeerReadyFrom = 0;
+	sSYNetPeerLastSender = -1;
+	{
+		s32 p;
+
+		for (p = 0; p < MAXCONTROLLERS; p++)
+		{
+			sSYNetPeerPadOf[p] = 0;
+		}
+	}
 	sSYNetPeerInputDelay = SYNETPEER_DEFAULT_INPUT_DELAY;
 	sSYNetPeerSessionID = SYNETPEER_DEFAULT_SESSION_ID;
 	sSYNetPeerBootstrapIsEnabled = FALSE;
@@ -1484,6 +1525,40 @@ void syNetPeerInitDebugEnv(void)
 	if (remote_player_env != NULL)
 	{
 		sSYNetPeerRemotePlayer = atoi(remote_player_env);
+	}
+	// Several players per device / more than two devices (set by the i64 module from its player table):
+	// SSB64_NETPLAY_LOCAL_MASK / _REMOTE_MASK (bit = port), _PADS = this device's controller per port
+	// ("0,1,0,0"), _MACHINES = devices in the session.
+	if ((getenv("SSB64_NETPLAY_LOCAL_MASK") != NULL) && (getenv("SSB64_NETPLAY_REMOTE_MASK") != NULL))
+	{
+		u32 local = (u32)atoi(getenv("SSB64_NETPLAY_LOCAL_MASK")) & 0xF;
+		u32 remote = (u32)atoi(getenv("SSB64_NETPLAY_REMOTE_MASK")) & 0xF & ~local;
+
+		if ((local != 0) && (remote != 0))
+		{
+			sSYNetPeerLocalMask = local;
+			sSYNetPeerRemoteMask = remote;
+			sSYNetPeerLocalPlayer = __builtin_ctz(local);
+			sSYNetPeerRemotePlayer = __builtin_ctz(remote);
+		}
+	}
+	if (getenv("SSB64_NETPLAY_PADS") != NULL)
+	{
+		const char *c = getenv("SSB64_NETPLAY_PADS");
+		s32 p = 0;
+
+		while ((*c != '\0') && (p < MAXCONTROLLERS))
+		{
+			if ((*c >= '0') && (*c <= '3'))
+			{
+				sSYNetPeerPadOf[p++] = *c - '0';
+			}
+			c++;
+		}
+	}
+	if ((getenv("SSB64_NETPLAY_MACHINES") != NULL) && (atoi(getenv("SSB64_NETPLAY_MACHINES")) >= 2))
+	{
+		sSYNetPeerMachines = atoi(getenv("SSB64_NETPLAY_MACHINES"));
 	}
 	if (delay_env != NULL)
 	{
@@ -1578,6 +1653,13 @@ void syNetPeerInitDebugEnv(void)
 		         sSYNetPeerLocalPlayer, sSYNetPeerRemotePlayer);
 		return;
 	}
+	if (sSYNetPeerLocalMask == 0)   // two players, one each (the env vars above)
+	{
+		sSYNetPeerLocalMask = 1u << sSYNetPeerLocalPlayer;
+		sSYNetPeerRemoteMask = 1u << sSYNetPeerRemotePlayer;
+	}
+	port_log("SSB64 NetPeer: players here %x, elsewhere %x, %d devices\n", sSYNetPeerLocalMask, sSYNetPeerRemoteMask,
+	         sSYNetPeerMachines);
 #if !defined(_WIN32)
 	if ((syNetPeerParseIPv4Address(bind_env, &sSYNetPeerBindAddress) == FALSE) ||
 		(syNetPeerParseIPv4Address(peer_env, &sSYNetPeerPeerAddress) == FALSE))
@@ -1687,8 +1769,15 @@ void syNetPeerStartVSSession(void)
 		// One continuous session: keep the connection, tick and slots; only
 		// arm rollback (if configured) for the battle.
 		sSYNetPeerRollbackIsEnabled = sSYNetPeerSessionRollbackArmed;
-		sSYNetPeerNextCheckpointTick = syNetInputGetTick();
-		port_log("SSB64 NetPeer: session battle start tick=%u rollback=%d\n", syNetInputGetTick(), sSYNetPeerRollbackIsEnabled);
+		// the first checkpoint on the 120-tick grid after the battle's first tick (that tick's own hash
+		// is recorded under the next tick number, so starting at it waited forever: no battle checks)
+		sSYNetPeerNextCheckpointTick = ((syNetInputGetTick() / SYNETPEER_LOG_INTERVAL) + 1) * SYNETPEER_LOG_INTERVAL;
+		port_log("SSB64 NetPeer: session battle start tick=%u rollback=%d players(kind/fighter)=%u/%u %u/%u %u/%u %u/%u\n",
+		         syNetInputGetTick(), sSYNetPeerRollbackIsEnabled,
+		         gSCManagerTransferBattleState.players[0].pkind, gSCManagerTransferBattleState.players[0].fkind,
+		         gSCManagerTransferBattleState.players[1].pkind, gSCManagerTransferBattleState.players[1].fkind,
+		         gSCManagerTransferBattleState.players[2].pkind, gSCManagerTransferBattleState.players[2].fkind,
+		         gSCManagerTransferBattleState.players[3].pkind, gSCManagerTransferBattleState.players[3].fkind);
 		return;
 	}
 	if (syNetPeerOpenSocket() == FALSE)
@@ -1946,7 +2035,8 @@ static void syNetPeerNetCreate(void)
 	memset(&config, 0, sizeof(config));
 	config.num_players = MAXCONTROLLERS;
 	config.local_player = sSYNetPeerLocalPlayer;
-	config.remote_mask = 1u << sSYNetPeerRemotePlayer;
+	config.local_mask = sSYNetPeerLocalMask;
+	config.remote_mask = sSYNetPeerRemoteMask;
 	config.session_id = sSYNetPeerSessionID;
 	config.start_tick = syNetInputGetTick();
 	config.input_delay = sSYNetPeerInputDelay;
@@ -2725,7 +2815,9 @@ void syNetPeerHandlePacket(const u8 *buffer, s32 size)
 void syNetPeerReceiveRemoteInput(void)
 {
 #if defined(PORT) && !defined(_WIN32)
-	u8 buffer[SYNETPEER_PACKET_BYTES];
+	// room for every n64net packet (a drop-out notice carries the leaver's last 64 inputs: ~550 bytes;
+	// a smaller buffer dropped it unseen and the others waited for the leaver for ever)
+	u8 buffer[2048];
 
 	syNetPeerSimFlush();
 	port_voice_pump();
@@ -3042,12 +3134,38 @@ void syNetPeerUpdate(void)
 // whatever player slot the match assigned it.
 sb32 syNetPeerCheckLocalPlayer(s32 player)
 {
-	return ((sSYNetPeerIsActive != FALSE) && (player == sSYNetPeerLocalPlayer)) ? TRUE : FALSE;
+	return ((sSYNetPeerIsActive != FALSE) && (player >= 0) && (player < MAXCONTROLLERS) &&
+	        ((sSYNetPeerLocalMask & (1u << player)) != 0)) ? TRUE : FALSE;
 }
 
+s32 syNetPeerGetFirstLocalPlayer(void)
+{
+	return sSYNetPeerLocalPlayer;
+}
+
+// A local player's controller on this device (the first one: 0; more players on one device: 1-3).
 s32 syNetPeerGetControllerPort(s32 player)
 {
-	return (syNetPeerCheckLocalPlayer(player) != FALSE) ? 0 : player;
+	return (syNetPeerCheckLocalPlayer(player) != FALSE) ? sSYNetPeerPadOf[player] : player;
+}
+
+// A device left a session of more than two (i64's drop-out menu): its player stays in, with nothing
+// pressed (agreed tick on every device: n64net_input_retire). Returns 0, or 1 if it can't.
+s32 syNetPeerDropoutIdle(s32 player)
+{
+#if defined(PORT) && !defined(_WIN32)
+	const uint8_t action[2] = { 3, 0 };   // N64_DROPOUT_IDLE
+	uint32_t apply = 0;
+
+	if ((sSYNetPeerNet == NULL) || (n64net_input_retire(sSYNetPeerNet, player, action, sizeof(action), &apply) == 0))
+	{
+		return 1;
+	}
+	port_log("SSB64 NetPeer: player %d left; idle from tick %u\n", player + 1, apply);
+	return 0;
+#else
+	return 1;
+#endif
 }
 
 // SSB64_NETPLAY_BOT=5 plays the whole game with intent (session tests):

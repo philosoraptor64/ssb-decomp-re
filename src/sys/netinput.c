@@ -11,6 +11,7 @@ extern void port_log(const char *fmt, ...);
 // the local and remote players' inputs, predictions and rollback requests
 // come from the shared n64net library instead of the histories below.
 extern void *syNetPeerGetNet(void);
+extern s32 syNetPeerGetFirstLocalPlayer(void);
 #define SYNETINPUT_NET() ((n64net_input *)syNetPeerGetNet())
 #else
 #define SYNETINPUT_NET() NULL
@@ -459,14 +460,33 @@ static sb32 syNetInputResolveNetFrame(s32 player, u32 tick, SYNetInputFrame *out
 		{
 			return FALSE;
 		}
-		// Sample only on ticks that will actually advance, never in a resimulation.
-		if ((syNetPeerCheckStartBarrierReleased() != FALSE) && (syNetInputCheckResimulating() == FALSE))
+		// Sample only on ticks that will actually advance, never in a resimulation. Every
+		// controller of this device at once (several players on one device: up to 4), at the
+		// first of its players.
+		if ((syNetPeerCheckStartBarrierReleased() != FALSE) && (syNetInputCheckResimulating() == FALSE) &&
+			(player == syNetPeerGetFirstLocalPlayer()))
 		{
-			syNetInputMakeLocalFrame(player, tick, &sample);
-			pad.buttons = sample.buttons;
-			pad.stick_x = sample.stick_x;
-			pad.stick_y = sample.stick_y;
-			n64net_input_set_local(net, tick, pad);
+			n64net_pad pads[N64NET_INPUT_MAX_PLAYERS];
+			s32 p;
+
+			for (p = 0; p < N64NET_INPUT_MAX_PLAYERS; p++)
+			{
+				pads[p].buttons = 0;
+				pads[p].stick_x = pads[p].stick_y = pads[p].rstick_x = pads[p].rstick_y = 0;
+				pads[p].buttons_hi = 0;
+			}
+			for (p = 0; p < MAXCONTROLLERS; p++)
+			{
+				if (syNetPeerCheckLocalPlayer(p) == FALSE)
+				{
+					continue;
+				}
+				syNetInputMakeLocalFrame(p, tick, &sample);
+				pads[p].buttons = sample.buttons;
+				pads[p].stick_x = sample.stick_x;
+				pads[p].stick_y = sample.stick_y;
+			}
+			n64net_input_set_local_pads(net, tick, pads);
 		}
 		n64net_input_get(net, player, tick, &pad);
 		syNetInputMakeFrame(out_frame, tick, pad.buttons, pad.stick_x, pad.stick_y, nSYNetInputSourceLocal, FALSE);
