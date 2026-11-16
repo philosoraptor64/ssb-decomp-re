@@ -678,7 +678,8 @@ void syNetPeerMakeBootstrapMetadata(SYNetInputReplayMetadata *metadata)
 	// SSB64_NETPLAY_P<n>_CPU=<level 1-9> makes that player the game's own
 	// computer opponent. The AI runs inside the simulation on both machines,
 	// so it needs no network input and rollback simply recomputes it.
-	for (player = 0; player < 2; player++)
+	// (P3/P4: players 3 and 4 join the match as CPUs: Kirby and Pikachu, e.g. for joining into a CPU slot)
+	for (player = 0; player < MAXCONTROLLERS; player++)
 	{
 		char key[] = "SSB64_NETPLAY_Pn_CPU";
 		const char *value;
@@ -690,6 +691,10 @@ void syNetPeerMakeBootstrapMetadata(SYNetInputReplayMetadata *metadata)
 		{
 			metadata->player_kinds[player] = nFTPlayerKindCom;
 			metadata->levels[player] = atoi(value);
+			if (player >= 2)
+			{
+				metadata->fighter_kinds[player] = syNetPeerGetBootstrapFighter(player, (player == 2) ? nFTKindKirby : nFTKindPikachu);
+			}
 		}
 	}
 }
@@ -2210,6 +2215,75 @@ static void syNetPeerServeJoiner(void)
 #endif
 
 // i64: this device joins a running session (before the session starts).
+// The session's host: players a newcomer could take over now as a new device (i64's "join as player N"): CPUs
+// nobody plays (in neither mask) that are CPUs in the session's rules. 0 = none (also while a join is running).
+u32 syNetPeerOpenPlayers(void)
+{
+#if defined(PORT) && !defined(_WIN32)
+	u32 mask = 0;
+	s32 player;
+	uint32_t back;
+
+	if ((sSYNetPeerNet == NULL) || (sSYNetPeerBootstrapIsHost == FALSE) || (sSYNetPeerJoinServing != FALSE))
+	{
+		return 0;
+	}
+	for (player = 0; player < MAXCONTROLLERS; player++)
+	{
+		if ((sSYNetPeerLocalMask | sSYNetPeerRemoteMask) & (1u << player))
+		{
+			continue;
+		}
+		if (n64net_input_rejoined(sSYNetPeerNet, player, &back) != 0)
+		{
+			continue;   // someone took it already
+		}
+		if (gSCManagerTransferBattleState.players[player].pkind == nFTPlayerKindCom)
+		{
+			mask |= 1u << player;
+		}
+	}
+	return mask;
+#else
+	return 0;
+#endif
+}
+
+// The session's host: a newcomer becomes device `machine` (a new one) and takes over the CPUs in `mask`
+// (n64net_input_add); every device makes them human at the agreed tick (syNetPeerApplyRetirements).
+// Returns 0, or 1 if it can't.
+s32 syNetPeerAdd(s32 machine, u32 mask)
+{
+#if defined(PORT) && !defined(_WIN32)
+	s32 player;
+
+	if ((sSYNetPeerNet == NULL) || (sSYNetPeerBootstrapIsHost == FALSE) || (machine <= 0) || (machine >= MAXCONTROLLERS) ||
+		(mask == 0) || ((mask & syNetPeerOpenPlayers()) != mask))
+	{
+		return 1;
+	}
+	if (n64net_input_add(sSYNetPeerNet, mask) == 0)
+	{
+		return 1;
+	}
+	for (player = 0; player < MAXCONTROLLERS; player++)
+	{
+		if (mask & (1u << player))
+		{
+			sSYNetPeerMachineOf[player] = machine;
+		}
+	}
+	sSYNetPeerJoinMachine = machine;
+	sSYNetPeerJoinReady = FALSE;
+	sSYNetPeerJoinServeFrames = 0;
+	sSYNetPeerJoinServing = TRUE;
+	port_log("SSB64 NetPeer: device %d joins as players %x (CPUs until now)\n", machine + 1, mask);
+	return 0;
+#else
+	return 1;
+#endif
+}
+
 void syNetPeerSetJoining(s32 is_joining)
 {
 #if defined(PORT) && !defined(_WIN32)
@@ -3357,6 +3431,15 @@ void syNetPeerApplyRetirements(u32 tick)
 
 		uint32_t back = 0;
 
+		// A CPU nobody played that a newcomer took over (n64net_input_add): its inputs come from the network
+		// from now on (neutral until the agreed tick, as before), here as on every other device. A departed
+		// player's port reads the network already.
+		if ((n64net_input_rejoined(sSYNetPeerNet, player, &back) != 0) && !(sSYNetPeerLocalMask & (1u << player)) &&
+			(syNetInputGetSlotSource(player) == nSYNetInputSourceSaved))
+		{
+			syNetInputSetSlotSource(player, nSYNetInputSourceRemotePredicted);
+			sSYNetPeerRemoteMask |= 1u << player;
+		}
 		// someone joined in that player's place: a human again from the agreed tick (the reverse of below)
 		if ((n64net_input_rejoined(sSYNetPeerNet, player, &back) != 0) && (tick == back))
 		{
