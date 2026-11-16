@@ -32,6 +32,7 @@ extern void port_net_set_end_reason(const char *why);   // port/net/netplay_tran
 extern int port_net_external_send(const unsigned char *data, unsigned int size);
 extern int port_net_external_recv(unsigned char *out, unsigned int cap);
 extern int port_net_external_recv_from(unsigned char *out, unsigned int cap, int *machine);
+extern int port_net_external_send_to(int machine, const unsigned char *data, unsigned int size);
 #endif
 #endif
 
@@ -128,6 +129,16 @@ u32 sSYNetPeerLocalMask;
 u32 sSYNetPeerRemoteMask;
 s32 sSYNetPeerPadOf[MAXCONTROLLERS];
 s32 sSYNetPeerMachines;
+s32 sSYNetPeerMachineOf[MAXCONTROLLERS] = { 0, 1, 2, 3 };   // each player's device (SSB64_NETPLAY_MACHINE_OF)
+// joining a running session (see syNetPeerAdmit / syNetPeerCatchingUp)
+static sb32 sSYNetPeerJoining = FALSE;
+static sb32 sSYNetPeerJoinServing = FALSE;     // the host: a newcomer is being sent the starting state
+static sb32 sSYNetPeerJoinReady = FALSE;
+static s32 sSYNetPeerJoinMachine = -1;
+static s32 sSYNetPeerJoinServeFrames = 0;
+static sb32 sSYNetPeerSessionStartSaved = FALSE;
+static LBBackupData sSYNetPeerSessionStartBackup;   // the host's save when the session began
+
 u32 sSYNetPeerReadyFrom;     // the host: guest devices that said READY (bit = device)
 s32 sSYNetPeerLastSender;    // the device the last received packet came from (-1 = unknown)
 u32 sSYNetPeerInputDelay;
@@ -800,6 +811,16 @@ void syNetPeerHandleControlPacket(const u8 *buffer, s32 size)
 	}
 	if (packet_type == SYNETPEER_PACKET_READY)
 	{
+#if defined(PORT) && !defined(_WIN32)
+		if ((sSYNetPeerJoinServing != FALSE) && (sSYNetPeerSessionIsActive != FALSE))
+		{
+			if ((sSYNetPeerLastSender < 0) || (sSYNetPeerLastSender == sSYNetPeerJoinMachine))
+			{
+				sSYNetPeerJoinReady = TRUE;
+			}
+			return;
+		}
+#endif
 		// every guest device (more than two: by sender; an unknown sender counts as all)
 		if ((sSYNetPeerMachines <= 2) || (sSYNetPeerLastSender < 0))
 		{
@@ -896,9 +917,14 @@ void syNetPeerSendSessionDataPacket(void)
 	syNetPeerWriteU16(&cursor, SYNETPEER_PACKET_SESSION_DATA);
 	syNetPeerWriteU32(&cursor, sSYNetPeerSessionID);
 	syNetPeerWriteU32(&cursor, (u32)sizeof(LBBackupData));
-	memcpy(cursor, &gSCManagerBackupData, sizeof(LBBackupData));
+	// (once the session runs, a newcomer gets the session's starting state, not the save as it is now)
+	memcpy(cursor, (sSYNetPeerSessionStartSaved != FALSE) ? &sSYNetPeerSessionStartBackup : &gSCManagerBackupData,
+	       sizeof(LBBackupData));
 	cursor += sizeof(LBBackupData);
-	port_netplay_settings_capture(sSYNetPeerSessionSettings);
+	if (sSYNetPeerSessionStartSaved == FALSE)
+	{
+		port_netplay_settings_capture(sSYNetPeerSessionSettings);
+	}
 	for (i = 0; i < SYNETPEER_SESSION_SETTINGS_COUNT; i++)
 	{
 		syNetPeerWriteU32(&cursor, (u32)sSYNetPeerSessionSettings[i]);
@@ -1136,7 +1162,12 @@ void syNetPeerSessionBegin(void)
 		// (never written to this machine's save: see lbBackupWrite).
 		gSCManagerBackupData = sSYNetPeerSessionBackup;
 	}
-	else port_netplay_settings_capture(sSYNetPeerSessionSettings);  // the host: its own settings
+	else
+	{
+		port_netplay_settings_capture(sSYNetPeerSessionSettings);  // the host: its own settings
+		sSYNetPeerSessionStartBackup = gSCManagerBackupData;       // (what a newcomer gets later)
+		sSYNetPeerSessionStartSaved = TRUE;
+	}
 	// Both use the host's gameplay settings until the session ends.
 	port_netplay_settings_begin(sSYNetPeerSessionSettings);
 	syNetInputReset();
@@ -1561,6 +1592,21 @@ void syNetPeerInitDebugEnv(void)
 	{
 		sSYNetPeerMachines = atoi(getenv("SSB64_NETPLAY_MACHINES"));
 	}
+	if (getenv("SSB64_NETPLAY_MACHINE_OF") != NULL)   // "0,1,2,1": player p plays on device n
+	{
+		const char *c = getenv("SSB64_NETPLAY_MACHINE_OF");
+		s32 p = 0;
+
+		while ((*c != '\0') && (p < MAXCONTROLLERS))
+		{
+			if ((*c >= '0') && (*c <= '3'))
+			{
+				sSYNetPeerMachineOf[p++] = *c - '0';
+			}
+			c++;
+		}
+	}
+	sSYNetPeerJoining = (getenv("SSB64_NETPLAY_JOINING") != NULL) && (atoi(getenv("SSB64_NETPLAY_JOINING")) != 0);
 	if (delay_env != NULL)
 	{
 		s32 delay = atoi(delay_env);
@@ -2026,6 +2072,21 @@ static uint64_t syNetPeerNetNow(void)
 // -1 = not set yet for this connection, 0 = menu delay, 1 = battle delay
 static s32 sSYNetPeerDelayMode = -1;
 
+// Joining a running session (i64 N64_LAUNCH_JOINING, SSB64_NETPLAY_JOINING=1): this device takes over a departed
+// device's players. The host sends it the session's starting state again (match config + the session data as it
+// was when the session began), then it replays the host's input log as fast as it can (port: frames not shown or
+// heard) until its players go live (n64net admit / rejoined).
+
+static void syNetPeerNetSendTo(void *user, int player, const uint8_t *data, uint32_t size)
+{
+	if ((player >= 0) && (player < MAXCONTROLLERS) && (port_net_external_active() != 0) &&
+		(port_net_external_send_to(sSYNetPeerMachineOf[player], data, size) != 0))
+	{
+		return;
+	}
+	syNetPeerNetSend(user, data, size);
+}
+
 // A new connection (VS match or online session) starts at the current tick.
 static void syNetPeerNetCreate(void)
 {
@@ -2044,6 +2105,8 @@ static void syNetPeerNetCreate(void)
 	config.rollback_window = 0;  // set per tick (syNetPeerNetSyncWindow)
 	config.ticks_per_second = 60;
 	config.send = syNetPeerNetSend;
+	config.send_to = syNetPeerNetSendTo;
+	config.joining = (sSYNetPeerJoining != FALSE) ? 1 : 0;
 	config.log = port_log;
 	config.now_usecs = syNetPeerNetNow;
 	sSYNetPeerNet = n64net_input_create(&config);
@@ -2110,6 +2173,109 @@ void *syNetPeerGetNet(void)
 }
 #endif
 
+#if defined(PORT) && !defined(_WIN32)
+// The host, every frame while a newcomer is being let in: the match config and the session's starting data
+// until it answers READY, then START (the same packets as the session's own start).
+static void syNetPeerServeJoiner(void)
+{
+	s32 i;
+
+	if ((sSYNetPeerJoinServing == FALSE) || (sSYNetPeerBootstrapIsHost == FALSE))
+	{
+		return;
+	}
+	sSYNetPeerJoinServeFrames++;
+	if (sSYNetPeerJoinReady != FALSE)
+	{
+		for (i = 0; i < 10; i++)
+		{
+			syNetPeerSendControlPacket(SYNETPEER_PACKET_START);
+		}
+		port_log("SSB64 NetPeer: the newcomer (device %d) has the session's start; it catches up now\n",
+		         sSYNetPeerJoinMachine + 1);
+		sSYNetPeerJoinServing = FALSE;
+		return;
+	}
+	if ((sSYNetPeerJoinServeFrames % 6) == 1)
+	{
+		syNetPeerSendMatchConfigPacket();
+		syNetPeerSendSessionDataPacket();
+	}
+	if (sSYNetPeerJoinServeFrames > 60 * 60)
+	{
+		port_log("SSB64 NetPeer: the newcomer never answered; stop sending it the session's start\n");
+		sSYNetPeerJoinServing = FALSE;
+	}
+}
+#endif
+
+// i64: this device joins a running session (before the session starts).
+void syNetPeerSetJoining(s32 is_joining)
+{
+#if defined(PORT) && !defined(_WIN32)
+	sSYNetPeerJoining = (is_joining != 0) ? TRUE : FALSE;
+#endif
+}
+
+// The session's host: a newcomer takes over device `machine`'s players. Returns 0, or 1 if it can't.
+s32 syNetPeerAdmit(s32 machine)
+{
+#if defined(PORT) && !defined(_WIN32)
+	u32 mask = 0;
+	s32 player;
+
+	if ((sSYNetPeerNet == NULL) || (sSYNetPeerBootstrapIsHost == FALSE) || (machine <= 0))
+	{
+		return 1;
+	}
+	for (player = 0; player < MAXCONTROLLERS; player++)
+	{
+		if ((sSYNetPeerRemoteMask & (1u << player)) && (sSYNetPeerMachineOf[player] == machine))
+		{
+			mask |= 1u << player;
+		}
+	}
+	if ((mask == 0) || (n64net_input_admit(sSYNetPeerNet, mask) == 0))
+	{
+		return 1;
+	}
+	sSYNetPeerJoinMachine = machine;
+	sSYNetPeerJoinReady = FALSE;
+	sSYNetPeerJoinServeFrames = 0;
+	sSYNetPeerJoinServing = TRUE;
+	port_log("SSB64 NetPeer: device %d joins in the place of players %x\n", machine + 1, mask);
+	return 0;
+#else
+	return 1;
+#endif
+}
+
+// The newcomer: 1 while it replays the host's log (frames not shown or heard; the port runs many per frame).
+s32 syNetPeerCatchingUp(void)
+{
+#if defined(PORT) && !defined(_WIN32)
+	static sb32 was = FALSE;
+	uint32_t live = U32_MAX;
+	sb32 catching;
+
+	if ((sSYNetPeerJoining == FALSE) || (sSYNetPeerNet == NULL) || (sSYNetPeerSessionIsActive == FALSE))
+	{
+		return 0;
+	}
+	(void)n64net_input_log_ticks(sSYNetPeerNet, &live);
+	catching = (n64net_input_catching_up(sSYNetPeerNet) != 0) || (live == U32_MAX) || (syNetInputGetTick() < live);
+	if (catching != was)
+	{
+		was = catching;
+		port_log("SSB64 NetPeer: %s at tick %u (live from %u)\n", (catching != FALSE) ? "catching up" : "caught up",
+		         syNetInputGetTick(), live);
+	}
+	return (catching != FALSE) ? 1 : 0;
+#else
+	return 0;
+#endif
+}
+
 void syNetPeerSendLocalInput(void)
 {
 #if defined(PORT) && !defined(_WIN32)
@@ -2119,6 +2285,7 @@ void syNetPeerSendLocalInput(void)
 	if (sSYNetPeerNet != NULL)
 	{
 		n64net_input_resend(sSYNetPeerNet);  // sampling sends; this covers losses while waiting
+		syNetPeerServeJoiner();
 		return;
 	}
 
@@ -3188,6 +3355,26 @@ void syNetPeerApplyRetirements(u32 tick)
 		uint32_t last, apply, size = 2;
 		uint8_t action[N64NET_INPUT_MAX_EVENT];
 
+		uint32_t back = 0;
+
+		// someone joined in that player's place: a human again from the agreed tick (the reverse of below)
+		if ((n64net_input_rejoined(sSYNetPeerNet, player, &back) != 0) && (tick == back))
+		{
+			gSCManagerTransferBattleState.players[player].pkind = nFTPlayerKindMan;
+			if ((syNetPeerSessionCheckInBattle() != FALSE) && (gSCManagerBattleState != NULL) &&
+				(gSCManagerBattleState->players[player].fighter_gobj != NULL))
+			{
+				FTStruct *fp = ftGetStruct(gSCManagerBattleState->players[player].fighter_gobj);
+
+				gSCManagerBattleState->players[player].pkind = nFTPlayerKindMan;
+				fp->pkind = nFTPlayerKindMan;
+			}
+			if (syNetInputCheckResimulating() == FALSE)
+			{
+				port_log("SSB64 NetPeer: tick %u: player %d is human again (joined mid-game)\n", tick, player + 1);
+			}
+			continue;
+		}
 		if (!n64net_input_retired(sSYNetPeerNet, player, &last, &apply, action, &size) || (tick != apply) ||
 			(size < 2) || (action[0] != 1))
 		{
