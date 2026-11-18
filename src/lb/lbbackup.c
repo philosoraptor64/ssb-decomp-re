@@ -55,7 +55,8 @@ void lbBackupWrite(void)
 #ifdef PORT
 // i64's "everything unlocked" (port/i64_module.cpp): every character, Mushroom Kingdom, the item switch and the
 // sound test, on a save of its own (the module points the save file elsewhere for such a run)
-extern int port_unlock_all_active(void);
+// i64 module: port/i64_module.cpp says whether this run plays the "everything unlocked" save; stand-alone: never.
+__attribute__((weak)) int port_unlock_all_active(void) { return 0; }
 extern void port_log(const char *fmt, ...);
 sb32 lbBackupIsSramValidRead(void);
 static void lbBackupApplyUnlockAll(void)

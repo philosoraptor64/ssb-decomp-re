@@ -966,6 +966,11 @@ void func_80005BFC(void)
 	osRecvMesg(&mq, NULL, OS_MESG_BLOCK);
 }
 
+#if defined(PORT)
+#include <sys/netpeer.h>
+u32 gPortSceneLoads;  // scene changes so far (port/rollback never rewinds across one)
+#endif
+
 // 0x80005C74
 void syTaskmanSetLoadScene(void)
 {
@@ -987,6 +992,14 @@ sb32 syTaskmanCheckBreakLoop(void)
 	switch (sSYTaskmanStatus)
 	{
 	case nSYTaskmanStatusLoadScene:
+#if defined(PORT)
+		// online session with rollback in the menus: the change must rest on confirmed inputs only
+		if (syNetPeerSettleSceneChange() == FALSE)
+		{
+			return FALSE;
+		}
+		gPortSceneLoads++;
+#endif
 		return TRUE;
 
 	case nSYTaskmanStatusUnk2:

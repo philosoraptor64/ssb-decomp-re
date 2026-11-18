@@ -224,6 +224,11 @@ LBBackupData sSYNetPeerSessionBackup;
 s32 sSYNetPeerSessionSettings[SYNETPEER_SESSION_SETTINGS_COUNT];
 u32 sSYNetPeerSessionRandom;
 sb32 sSYNetPeerSessionRollbackArmed;  // rollback configured: used inside session battles
+// Rollback in the session's menus too (owner's item 10; SSB64_NETPLAY_MENU_ROLLBACK=0 = menus in lockstep, as before):
+// every scene rolls back; a scene change only happens once every input before it is confirmed
+// (syNetPeerSettleSceneChange), since loading the next scene can't be undone.
+sb32 sSYNetPeerSessionMenuRollback = TRUE;
+u32 sSYNetPeerSceneSettles, sSYNetPeerSceneRedecides;
 // Recent fingerprints (tick, kind, hash) from this machine and the peer.
 u32 sSYNetPeerSyncLocalTick[SYNETPEER_SYNC_CHECK_RING], sSYNetPeerSyncLocalKind[SYNETPEER_SYNC_CHECK_RING], sSYNetPeerSyncLocalHash[SYNETPEER_SYNC_CHECK_RING];
 u32 sSYNetPeerSyncRemoteTick[SYNETPEER_SYNC_CHECK_RING], sSYNetPeerSyncRemoteKind[SYNETPEER_SYNC_CHECK_RING], sSYNetPeerSyncRemoteHash[SYNETPEER_SYNC_CHECK_RING];
@@ -1733,9 +1738,19 @@ void syNetPeerInitDebugEnv(void)
 	{
 		struct timespec ts;
 
-		// Rollback only inside battles; the menus run in lockstep.
+		// Rollback inside battles; in the menus too unless SSB64_NETPLAY_MENU_ROLLBACK=0 (then lockstep there).
 		sSYNetPeerSessionRollbackArmed = sSYNetPeerRollbackIsEnabled;
-		sSYNetPeerRollbackIsEnabled = FALSE;
+		if (getenv("SSB64_NETPLAY_MENU_ROLLBACK") != NULL)
+		{
+			sSYNetPeerSessionMenuRollback = (atoi(getenv("SSB64_NETPLAY_MENU_ROLLBACK")) != 0) ? TRUE : FALSE;
+		}
+		if ((sSYNetPeerSessionRollbackArmed == FALSE) || (sSYNetPeerSessionMenuRollback == FALSE))
+		{
+			sSYNetPeerSessionMenuRollback = FALSE;
+			sSYNetPeerRollbackIsEnabled = FALSE;
+		}
+		port_log("SSB64 NetPeer: session rollback %s\n", (sSYNetPeerSessionMenuRollback != FALSE) ? "everywhere (menus too)" :
+		         ((sSYNetPeerSessionRollbackArmed != FALSE) ? "in battles (menus lockstep)" : "off"));
 		sSYNetPeerBootstrapIsEnabled = TRUE;
 
 		if (sSYNetPeerBootstrapIsHost != FALSE)
@@ -2130,7 +2145,8 @@ static void syNetPeerNetDestroy(void)
 static void syNetPeerNetSyncWindow(void)
 {
 	sb32 is_rollback = (sSYNetPeerRollbackIsEnabled != FALSE) &&
-	                   ((sSYNetPeerSessionIsActive == FALSE) || (syNetPeerSessionCheckInBattle() != FALSE));
+	                   ((sSYNetPeerSessionIsActive == FALSE) || (syNetPeerSessionCheckInBattle() != FALSE) ||
+	                    (sSYNetPeerSessionMenuRollback != FALSE));
 
 	n64net_input_set_window(sSYNetPeerNet, (is_rollback != FALSE) ? sSYNetPeerRollbackWindow : 0);
 
@@ -2526,6 +2542,71 @@ static sb32 syNetPeerCheckPeerSilentFor(u64 usecs)
 static u64 syNetPeerGetGiveUpUsecs(void)
 {
 	return (syNetPeerCheckPeerAway() != FALSE) ? SYNETPEER_AWAY_GIVEUP_USECS : SYNETPEER_SESSION_LOCKSTEP_GIVEUP_USECS;
+}
+
+// TRUE while a session rolls back in every scene (menus included).
+sb32 syNetPeerSessionRollbackEverywhere(void)
+{
+	return ((sSYNetPeerIsActive != FALSE) && (sSYNetPeerSessionIsActive != FALSE) &&
+	        (sSYNetPeerSessionMenuRollback != FALSE) && (sSYNetPeerRollbackIsEnabled != FALSE)) ? TRUE : FALSE;
+}
+
+// The game asked for a scene change (taskman: syTaskmanSetLoadScene). The next scene loads inside this frame and no
+// rollback can undo that, so with rollback in the menus every input it was decided on must be known first: wait
+// until all inputs up to the last tick read are confirmed. If one of them was guessed wrong, the change may be
+// wrong too: return FALSE (don't load now); the next frame rolls back to before the wrong guess and decides again.
+sb32 syNetPeerSettleSceneChange(void)
+{
+#if defined(PORT) && !defined(_WIN32)
+	u32 last;
+	u32 waited_usecs = 0;
+	uint32_t confirmed, pending;
+
+	if ((sSYNetPeerNet == NULL) || (syNetPeerSessionRollbackEverywhere() == FALSE) || (syNetInputGetTick() == 0))
+	{
+		return TRUE;
+	}
+	last = syNetInputGetTick() - 1;  // the last tick whose inputs this frame used
+
+	for (;;)
+	{
+		confirmed = n64net_input_confirmed_tick(sSYNetPeerNet);
+
+		if ((confirmed != UINT32_MAX) && (confirmed >= last))
+		{
+			break;
+		}
+		if ((waited_usecs >= 1000000) && (syNetPeerCheckPeerSilentFor(syNetPeerGetGiveUpUsecs()) != FALSE))
+		{
+			syNetPeerSessionEnd("the other player stopped responding");
+			return TRUE;
+		}
+		if ((waited_usecs % SYNETPEER_LOCKSTEP_RESEND_USECS) == 0)
+		{
+			syNetPeerSendLocalInput();
+		}
+		usleep(SYNETPEER_LOCKSTEP_POLL_USECS);
+		waited_usecs += SYNETPEER_LOCKSTEP_POLL_USECS;
+		port_watchdog_note_yield();
+		syNetPeerReceiveRemoteInput();
+	}
+	sSYNetPeerSceneSettles++;
+	sSYNetPeerStallUsecs += waited_usecs;
+
+	if ((n64net_peek_rollback(sSYNetPeerNet, &pending) != 0) && (pending <= last))
+	{
+		sSYNetPeerSceneRedecides++;
+		port_log("SSB64 NetPeer: scene change at tick %u was decided on a wrong guess (tick %u): deciding again\n",
+		         last, pending);
+		return FALSE;
+	}
+	if (syNetInputCheckResimulating() == FALSE)
+	{
+		port_log("SSB64 NetPeer: scene %u -> next at tick %u (settled, waited %u ms)\n", gSCManagerSceneData.scene_curr,
+		         last, waited_usecs / 1000);
+	}
+#endif
+	return TRUE;
 }
 
 static void syNetPeerShowWaitStatus(void)
@@ -3903,8 +3984,8 @@ void syNetPeerStopVSSession(void)
 #if defined(PORT) && !defined(_WIN32)
 	if (sSYNetPeerSessionIsActive != FALSE)
 	{
-		// Back to the menus: keep the session, lockstep again.
-		sSYNetPeerRollbackIsEnabled = FALSE;
+		// Back to the menus: keep the session (lockstep again unless the menus roll back too).
+		sSYNetPeerRollbackIsEnabled = sSYNetPeerSessionMenuRollback;
 		port_log("SSB64 NetPeer: session battle stop tick=%u\n", syNetInputGetTick());
 		return;
 	}

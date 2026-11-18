@@ -14,6 +14,8 @@ extern void syNetPeerStopVSSession(void);
 extern void syNetPeerWaitForRemoteInput(u32 tick);
 extern sb32 syNetPeerCheckLocalPlayer(s32 player);
 extern sb32 syNetPeerCheckRollbackEnabled(void);
+extern sb32 syNetPeerSessionRollbackEverywhere(void);
+extern sb32 syNetPeerSettleSceneChange(void);
 extern sb32 syNetPeerCheckActive(void);
 extern sb32 syNetPeerCheckRemoteInputReady(u32 tick);
 extern void syNetPeerRecordTickHash(void);
