@@ -136,6 +136,9 @@ static sb32 sSYNetPeerJoinServing = FALSE;     // the host: a newcomer is being 
 static sb32 sSYNetPeerJoinReady = FALSE;
 static s32 sSYNetPeerJoinMachine = -1;
 static s32 sSYNetPeerJoinServeFrames = 0;
+static u32 sSYNetPeerAddMaskOf[MAXCONTROLLERS];   // the host: the players syNetPeerAdd gave each new device
+static u32 sSYNetPeerHoldNext = 0;
+static s32 sSYNetPeerAddPrevMachine[MAXCONTROLLERS];   // what sSYNetPeerMachineOf said before syNetPeerAdd               // devices whose coming syNetPeerAdd starts held (watch first)
 static sb32 sSYNetPeerSessionStartSaved = FALSE;
 static LBBackupData sSYNetPeerSessionStartBackup;   // the host's save when the session began
 
@@ -2254,7 +2257,17 @@ u32 syNetPeerOpenPlayers(void)
 		{
 			continue;   // someone took it already
 		}
+		if ((sSYNetPeerAddMaskOf[1] | sSYNetPeerAddMaskOf[2] | sSYNetPeerAddMaskOf[3]) & (1u << player))
+		{
+			continue;   // a newcomer is joining as it (watching first)
+		}
 		if (gSCManagerTransferBattleState.players[player].pkind == nFTPlayerKindCom)
+		{
+			mask |= 1u << player;
+		}
+		// tests: SSB64_TEST_OPEN_PLAYERS=<mask, decimal> offers those players even when no CPU plays them (the session's
+		// menus pick the fighters, so test runs have no CPUs)
+		else if ((getenv("SSB64_TEST_OPEN_PLAYERS") != NULL) && ((u32)atoi(getenv("SSB64_TEST_OPEN_PLAYERS")) & (1u << player)))
 		{
 			mask |= 1u << player;
 		}
@@ -2278,14 +2291,21 @@ s32 syNetPeerAdd(s32 machine, u32 mask)
 	{
 		return 1;
 	}
+	if (sSYNetPeerHoldNext & (1u << machine))
+	{
+		n64net_input_hold_join(sSYNetPeerNet, mask, 1);   // watch first: live only once the host's player agrees
+	}
+	sSYNetPeerHoldNext &= ~(1u << machine);
 	if (n64net_input_add(sSYNetPeerNet, mask) == 0)
 	{
 		return 1;
 	}
+	sSYNetPeerAddMaskOf[machine] = mask;
 	for (player = 0; player < MAXCONTROLLERS; player++)
 	{
 		if (mask & (1u << player))
 		{
+			sSYNetPeerAddPrevMachine[player] = sSYNetPeerMachineOf[player];
 			sSYNetPeerMachineOf[player] = machine;
 		}
 	}
@@ -2294,6 +2314,63 @@ s32 syNetPeerAdd(s32 machine, u32 mask)
 	sSYNetPeerJoinServeFrames = 0;
 	sSYNetPeerJoinServing = TRUE;
 	port_log("SSB64 NetPeer: device %d joins as players %x (CPUs until now)\n", machine + 1, mask);
+	return 0;
+#else
+	return 1;
+#endif
+}
+
+// The session's host, around syNetPeerAdd (n64_game_hold_join): 1 = that device watches until let in (before
+// syNetPeerAdd), 0 = let it in, -1 = it left before that (its CPUs stay CPUs, free again). Returns 0, or 1.
+s32 syNetPeerHoldJoin(s32 machine, s32 hold)
+{
+#if defined(PORT) && !defined(_WIN32)
+	u32 mask;
+	s32 player;
+
+	if ((sSYNetPeerNet == NULL) || (sSYNetPeerBootstrapIsHost == FALSE) || (machine <= 0) || (machine >= MAXCONTROLLERS))
+	{
+		return 1;
+	}
+	mask = sSYNetPeerAddMaskOf[machine];
+	if (hold > 0)
+	{
+		if (mask != 0)
+		{
+			n64net_input_hold_join(sSYNetPeerNet, mask, 1);
+		}
+		else
+		{
+			sSYNetPeerHoldNext |= 1u << machine;
+		}
+		return 0;
+	}
+	sSYNetPeerHoldNext &= ~(1u << machine);
+	if (hold == 0)
+	{
+		if (mask != 0)
+		{
+			n64net_input_hold_join(sSYNetPeerNet, mask, 0);
+		}
+		return 0;
+	}
+	if ((mask == 0) || (n64net_input_cancel_join(sSYNetPeerNet, mask) == 0))
+	{
+		return 1;
+	}
+	for (player = 0; player < MAXCONTROLLERS; player++)
+	{
+		if (mask & (1u << player))
+		{
+			sSYNetPeerMachineOf[player] = sSYNetPeerAddPrevMachine[player];
+		}
+	}
+	sSYNetPeerAddMaskOf[machine] = 0;
+	if (sSYNetPeerJoinMachine == machine)
+	{
+		sSYNetPeerJoinServing = FALSE;
+	}
+	port_log("SSB64 NetPeer: the watching newcomer (device %d) left: players %x stay CPUs\n", machine + 1, mask);
 	return 0;
 #else
 	return 1;
@@ -2353,7 +2430,8 @@ s32 syNetPeerCatchingUp(void)
 		return 0;
 	}
 	(void)n64net_input_log_ticks(sSYNetPeerNet, &live);
-	catching = (n64net_input_catching_up(sSYNetPeerNet) != 0) || (live == U32_MAX) || (syNetInputGetTick() < live);
+	// (n64net: before the live tick; while the host holds the join, only when far behind its log = watching)
+	catching = (n64net_input_fast_forward(sSYNetPeerNet, syNetInputGetTick()) != 0) ? TRUE : FALSE;
 	if (catching != was)
 	{
 		was = catching;
