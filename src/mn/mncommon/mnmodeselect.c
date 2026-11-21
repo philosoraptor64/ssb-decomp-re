@@ -839,6 +839,20 @@ void mnModeSelectFuncRun(GObj *gobj)
             switch (sMNModeSelectOption)
             {
             case nMNModeSelectOption1PMode:
+#if defined(PORT)
+                {
+                    // Online session: the 1P modes aren't online yet (the planned "the friend watches" mode). Entering
+                    // one crashed in the 1P intro (no fighter for the player: conformance suite, 2026-11-21), so
+                    // the option says no, as a locked one does.
+                    extern sb32 syNetPeerSessionCheckActive(void);
+
+                    if (syNetPeerSessionCheckActive() != FALSE)
+                    {
+                        func_800269C0_275C0(nSYAudioFGMMenuDenied);
+                        break;
+                    }
+                }
+#endif
                 func_800269C0_275C0(nSYAudioFGMMenuSelect);
                 
                 gSCManagerSceneData.scene_prev = gSCManagerSceneData.scene_curr;
