@@ -853,6 +853,23 @@ void syNetInputFuncRead(void)
 	{
 		syNetInputResolveFrame(player, tick, &frame);
 		syNetInputPublishFrame(player, &frame);
+#if defined(PORT)
+		{
+			// SSB64_NETPLAY_TRACE_INPUT=N: log every input the game is given for ticks < N (resim = a replay)
+			extern char *getenv(const char *);
+			extern int atoi(const char *);
+			static s32 trace_until = -1;
+			if (trace_until < 0)
+			{
+				trace_until = (getenv("SSB64_NETPLAY_TRACE_INPUT") != NULL) ? atoi(getenv("SSB64_NETPLAY_TRACE_INPUT")) : 0;
+			}
+			if ((player < 2) && ((s32)tick < trace_until))
+			{
+				port_log("SSB64 InTrace t=%u p%d b=%04x x=%d y=%d pred=%d resim=%d\n", tick, player, frame.buttons,
+				         frame.stick_x, frame.stick_y, frame.is_predicted, syNetInputCheckResimulating());
+			}
+		}
+#endif
 
 		if (sSYNetInputIsRecording != FALSE)
 		{

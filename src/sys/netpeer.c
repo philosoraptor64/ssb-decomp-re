@@ -230,7 +230,19 @@ sb32 sSYNetPeerSessionRollbackArmed;  // rollback configured: used inside sessio
 // Rollback in the session's menus too (owner's item 10; SSB64_NETPLAY_MENU_ROLLBACK=0 = menus in lockstep, as before):
 // every scene rolls back; a scene change only happens once every input before it is confirmed
 // (syNetPeerSettleSceneChange), since loading the next scene can't be undone.
-sb32 sSYNetPeerSessionMenuRollback = TRUE;
+// OFF by default since 2026-11-21: the owner's phone session desynced in the menus. Three causes are fixed (a replay
+// now re-runs ticks, not frames; menu sync checks wait for confirmed inputs; a scene load no longer drops the states
+// saved after it), but a scene loaded inside a replay still comes out different on the two machines (pair test with
+// SSB64_NETPLAY_BOT=4 on both sides + SSB64_NETPLAY_SIM_LATENCY_MS=60: desync at the 26 -> 58 change).
+// SSB64_NETPLAY_MENU_ROLLBACK=1 turns it on for that work.
+sb32 sSYNetPeerSessionMenuRollback = FALSE;
+#ifndef SSB64_SNAPSHOT_OUTSIDE
+#define SSB64_SNAPSHOT_OUTSIDE
+#endif
+// The newest menu sync check, held until its inputs are confirmed (syNetPeerSessionFuncRead). Outside the rollback
+// snapshot: a rewind must not bring back a check already sent, and a replay overwrites it with the corrected one.
+SSB64_SNAPSHOT_OUTSIDE sb32 sSYNetPeerSessionSyncPending;
+SSB64_SNAPSHOT_OUTSIDE u32 sSYNetPeerSessionSyncPendingTick, sSYNetPeerSessionSyncPendingHash;
 u32 sSYNetPeerSceneSettles, sSYNetPeerSceneRedecides;
 // Recent fingerprints (tick, kind, hash) from this machine and the peer.
 u32 sSYNetPeerSyncLocalTick[SYNETPEER_SYNC_CHECK_RING], sSYNetPeerSyncLocalKind[SYNETPEER_SYNC_CHECK_RING], sSYNetPeerSyncLocalHash[SYNETPEER_SYNC_CHECK_RING];
@@ -1323,13 +1335,53 @@ void syNetPeerSessionFuncRead(void)
 	syNetInputFuncRead();
 	syNetPeerUpdate();
 
+	static s32 hash_trace_until = -1;  // SSB64_NETPLAY_TRACE_INPUT=N: also the session state hash of every tick < N
+
+	if (hash_trace_until < 0)
+	{
+		hash_trace_until = (getenv("SSB64_NETPLAY_TRACE_INPUT") != NULL) ? atoi(getenv("SSB64_NETPLAY_TRACE_INPUT")) : 0;
+	}
+	if ((s32)syNetInputGetTick() < hash_trace_until)
+	{
+		port_log("SSB64 HashTrace t=%u h=%08X scene=%u resim=%d\n", syNetInputGetTick(), syNetPeerSessionHashState(),
+		         gSCManagerSceneData.scene_curr, syNetInputCheckResimulating());
+	}
 	if ((syNetInputGetTick() % 120) == 0)
 	{
 		u32 hash = syNetPeerSessionHashState();
 
-		port_log("SSB64 SessionSync: tick=%u scene=%u hash=%08X\n", syNetInputGetTick(), gSCManagerSceneData.scene_curr, hash);
-		syNetPeerSyncCheckRecord(syNetInputGetTick(), 0, hash);
+#if defined(PORT) && !defined(_WIN32)
+		if ((sSYNetPeerNet != NULL) && (syNetPeerSessionRollbackEverywhere() != FALSE))
+		{
+			// Rolling back in the menus: this state may rest on guessed inputs. Keep it (a replay overwrites it
+			// with the corrected one) and send it once every input it was made from is confirmed (below), as the
+			// battles do. Sending it at once made the peer see a "desync" that the next rollback would have fixed.
+			sSYNetPeerSessionSyncPendingTick = syNetInputGetTick();
+			sSYNetPeerSessionSyncPendingHash = hash;
+			sSYNetPeerSessionSyncPending = TRUE;
+		}
+		else
+#endif
+		{
+			port_log("SSB64 SessionSync: tick=%u scene=%u hash=%08X\n", syNetInputGetTick(), gSCManagerSceneData.scene_curr, hash);
+			syNetPeerSyncCheckRecord(syNetInputGetTick(), 0, hash);
+		}
 	}
+#if defined(PORT) && !defined(_WIN32)
+	if ((sSYNetPeerSessionSyncPending != FALSE) && (syNetInputCheckResimulating() == FALSE))
+	{
+		// the hash at tick T was taken after the inputs of ticks < T: those must all be confirmed
+		uint32_t confirmed = n64net_input_confirmed_tick(sSYNetPeerNet);
+
+		if ((confirmed != UINT32_MAX) && ((confirmed + 1) >= sSYNetPeerSessionSyncPendingTick))
+		{
+			sSYNetPeerSessionSyncPending = FALSE;
+			port_log("SSB64 SessionSync: tick=%u scene=%u hash=%08X (confirmed)\n", sSYNetPeerSessionSyncPendingTick,
+			         gSCManagerSceneData.scene_curr, sSYNetPeerSessionSyncPendingHash);
+			syNetPeerSyncCheckRecord(sSYNetPeerSessionSyncPendingTick, 0, sSYNetPeerSessionSyncPendingHash);
+		}
+	}
+#endif
 }
 
 // Called at the start of every VS battle scene (scVSBattleStartScene), before
