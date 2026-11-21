@@ -4152,3 +4152,36 @@ void syNetPeerStopVSSession(void)
 #endif
 	sSYNetPeerIsActive = FALSE;
 }
+
+/* For i64's n64_game_phase (port/i64_module.cpp): 0 = menus/intro/results, 1 = play. *humans = human players in
+ * that play (VS battles: the battle state's HMN slots; 1P game/bonus/training: 1). */
+s32 syNetPeerGamePhase(u32 *humans)
+{
+	s32 i;
+	u32 n = 0;
+
+	switch (gSCManagerSceneData.scene_curr)
+	{
+	case nSCKindVSBattle:
+		for (i = 0; i < GMCOMMON_PLAYERS_MAX; i++)
+		{
+			if (gSCManagerBattleState != NULL && gSCManagerBattleState->players[i].pkind == nFTPlayerKindMan)
+			{
+				n++;
+			}
+		}
+		break;
+
+	case nSCKind1PGame:
+	case nSCKind1PBonusStage:
+	case nSCKind1PTrainingMode:
+		n = 1;
+		break;
+
+	default:
+		*humans = 0;
+		return 0;
+	}
+	*humans = n;
+	return 1;
+}
