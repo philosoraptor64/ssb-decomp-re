@@ -225,17 +225,19 @@ sb32 sSYNetPeerSessionIsActive;
 sb32 sSYNetPeerSessionDataReceived;
 LBBackupData sSYNetPeerSessionBackup;
 s32 sSYNetPeerSessionSettings[SYNETPEER_SESSION_SETTINGS_COUNT];
-u32 sSYNetPeerSessionRandom;
+// The menus' random picks (syNetPeerSessionNextRandom): game state, so a rollback rewinds it with the rest
+// (this file is outside the snapshot; a replay that re-ran a random pick drew the next number: 2026-11-21).
+SSB64_SNAPSHOT_INSIDE u32 sSYNetPeerSessionRandom;
 sb32 sSYNetPeerSessionRollbackArmed;  // rollback configured: used inside session battles
 // Rollback in the session's menus too (owner's item 10; SSB64_NETPLAY_MENU_ROLLBACK=0 = menus in lockstep, as before):
 // every scene rolls back; a scene change only happens once every input before it is confirmed
 // (syNetPeerSettleSceneChange), since loading the next scene can't be undone.
-// OFF by default since 2026-11-21: the owner's phone session desynced in the menus. Three causes are fixed (a replay
-// now re-runs ticks, not frames; menu sync checks wait for confirmed inputs; a scene load no longer drops the states
-// saved after it), but a scene loaded inside a replay still comes out different on the two machines (pair test with
-// SSB64_NETPLAY_BOT=4 on both sides + SSB64_NETPLAY_SIM_LATENCY_MS=60: desync at the 26 -> 58 change).
-// SSB64_NETPLAY_MENU_ROLLBACK=1 turns it on for that work.
-sb32 sSYNetPeerSessionMenuRollback = FALSE;
+// ON again since 2026-11-21 (it was off for a day: the owner's phone session desynced in the menus). Four causes are
+// fixed: a replay re-runs ticks, not frames; menu sync checks wait for confirmed inputs; a scene load keeps the states
+// saved after it; and the menus' session RNG (sSYNetPeerSessionRandom) is in the snapshot, since a replay that re-ran
+// a random pick drew the next number. Pair test, SSB64_NETPLAY_BOT=4 or 5 on both sides, guest on 60 ms + 40 jitter
+// + 3% loss: in sync over 2 minutes of menus and of VS battles.
+sb32 sSYNetPeerSessionMenuRollback = TRUE;
 #ifndef SSB64_SNAPSHOT_OUTSIDE
 #define SSB64_SNAPSHOT_OUTSIDE
 #endif
@@ -1343,8 +1345,15 @@ void syNetPeerSessionFuncRead(void)
 	}
 	if ((s32)syNetInputGetTick() < hash_trace_until)
 	{
-		port_log("SSB64 HashTrace t=%u h=%08X scene=%u resim=%d\n", syNetInputGetTick(), syNetPeerSessionHashState(),
-		         gSCManagerSceneData.scene_curr, syNetInputCheckResimulating());
+		SYNetInputReplayMetadata tr_settings;
+
+		syNetReplayCaptureBattleMetadata(&gSCManagerTransferBattleState, &tr_settings);
+		port_log("SSB64 HashTrace t=%u h=%08X scene=%u resim=%d prev=%u gkind=%u srand=%08X rand=%08X set=%08X "
+		         "b=%04x,%04x\n", syNetInputGetTick(), syNetPeerSessionHashState(),
+		         gSCManagerSceneData.scene_curr, syNetInputCheckResimulating(), gSCManagerSceneData.scene_prev,
+		         gSCManagerSceneData.gkind, sSYNetPeerSessionRandom, (u32)syUtilsRandSeed(),
+		         syNetPeerChecksumBytes((const u8 *)&tr_settings, sizeof(tr_settings)),
+		         gSYControllerDevices[0].button_hold, gSYControllerDevices[1].button_hold);
 	}
 	if ((syNetInputGetTick() % 120) == 0)
 	{
@@ -1372,8 +1381,13 @@ void syNetPeerSessionFuncRead(void)
 	{
 		// the hash at tick T was taken after the inputs of ticks < T: those must all be confirmed
 		uint32_t confirmed = n64net_input_confirmed_tick(sSYNetPeerNet);
+		uint32_t rewind;
 
-		if ((confirmed != UINT32_MAX) && ((confirmed + 1) >= sSYNetPeerSessionSyncPendingTick))
+		// ... and no rollback may still be due before it: a confirmed input that differs from the guess the state was
+		// made from is fixed only by the next frame's replay, which then records the corrected hash (sending at
+		// once sent the guessed state's hash: a false DESYNC in the conformance suite, 2026-11-21)
+		if ((confirmed != UINT32_MAX) && ((confirmed + 1) >= sSYNetPeerSessionSyncPendingTick) &&
+		    !((n64net_peek_rollback(sSYNetPeerNet, &rewind) != 0) && (rewind < sSYNetPeerSessionSyncPendingTick)))
 		{
 			sSYNetPeerSessionSyncPending = FALSE;
 			port_log("SSB64 SessionSync: tick=%u scene=%u hash=%08X (confirmed)\n", sSYNetPeerSessionSyncPendingTick,
