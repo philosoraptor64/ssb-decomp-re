@@ -818,6 +818,7 @@ u32 syNetSyncHashBattleFighters(void)
 		u32 contribution;
 
 		fp = ftGetStruct(fighter_gobj);
+		if (fp == NULL) continue; /* not a built fighter (see port_rollback_game_in_battle) */
 
 		contribution = SYNETSYNC_FNV_BASIS;
 
@@ -860,6 +861,7 @@ u32 syNetSyncHashFighters(void)
 	     fighter_gobj = fighter_gobj->link_next)
 	{
 		FTStruct *fp = ftGetStruct(fighter_gobj);
+		if (fp == NULL) continue; /* not a built fighter */
 
 		if (fp == NULL)
 		{
@@ -884,6 +886,7 @@ u32 syNetSyncHashJoints(void)
 	     fighter_gobj = fighter_gobj->link_next)
 	{
 		FTStruct *fp = ftGetStruct(fighter_gobj);
+		if (fp == NULL) continue; /* not a built fighter */
 
 		if (fp == NULL)
 		{

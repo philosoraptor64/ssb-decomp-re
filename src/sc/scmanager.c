@@ -1005,6 +1005,12 @@ void scManagerRunLoop(sb32 arg)
 
 		port_log("SSB64: scManagerRunLoop — entering scene %d\n",
 		         (int)gSCManagerSceneData.scene_curr);
+		{
+			/* the scene that really runs now: scene_curr already names the NEXT scene while the old one still
+			 * runs (online, a scene change decided on a wrong guess is decided again a frame later) */
+			extern s32 gPortSceneRunning;
+			gPortSceneRunning = gSCManagerSceneData.scene_curr;
+		}
 
 		/* Issue #103 defence: clear cross-scene GObj pointers in the three
 		 * persistent battle-state structs before dispatching the next scene.

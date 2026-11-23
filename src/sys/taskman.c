@@ -968,6 +968,7 @@ void func_80005BFC(void)
 
 #if defined(PORT)
 #include <sys/netpeer.h>
+s32 gPortSceneRunning = -1;  // the scene scManagerRunLoop entered last (scmanager.c)
 u32 gPortSceneLoads;  // scene changes so far (port/rollback never rewinds across one)
 #endif
 
