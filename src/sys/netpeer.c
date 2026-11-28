@@ -2178,7 +2178,7 @@ static void syNetPeerNetSendTo(void *user, int player, const uint8_t *data, uint
 
 // A new connection (VS match or online session) starts at the current tick.
 // Resync after a desync (n64net_resync_*, port/rollback/rollback.cpp: battles only, where rollback runs):
-// the host's state comes over with pointers translated. Off unless SSB64_NETPLAY_RESYNC=1 (see below).
+// the host's state comes over with pointers translated. On unless SSB64_NETPLAY_RESYNC=0 (see below).
 static sb32 sSYNetPeerResyncOn = FALSE;
 static sb32 sSYNetPeerResyncFailed = FALSE;
 static u32 sSYNetPeerResyncsDone = 0;
@@ -2194,10 +2194,11 @@ static void syNetPeerResyncEnable(void)
 	sSYNetPeerResyncOn = FALSE;
 	sSYNetPeerResyncFailed = FALSE;
 	sSYNetPeerResyncsDone = 0;
-	// OFF by default (SSB64_NETPLAY_RESYNC=1: on, for tests): a resync of states in step crashed the guest in its
-	// audio a frame after the load. The host's and guest's scheduler queues, coroutine stacks and audio (paced per
-	// device) differ even in step; rollback restores a device's own copy of them, a resync brings the host's.
-	if ((sSYNetPeerNet == NULL) || (getenv("SSB64_NETPLAY_RESYNC") == NULL) || !atoi(getenv("SSB64_NETPLAY_RESYNC")))
+	// On by default (SSB64_NETPLAY_RESYNC=0: off). The audio system stays each machine's own in a resync (it is
+	// paced per device; the host's copy crashed the guest's voice handler), and so do the input slots' local/remote
+	// roles (the host's made both machines wait for a player nobody sends): rollback.cpp, netinput.c.
+	if ((sSYNetPeerNet == NULL) ||
+	    ((getenv("SSB64_NETPLAY_RESYNC") != NULL) && (atoi(getenv("SSB64_NETPLAY_RESYNC")) == 0)))
 	{
 		return;
 	}
@@ -2263,7 +2264,7 @@ static void syNetPeerResyncPoll(void)
 
 // Tests (battle frames, rollback.cpp): SSB64_NETPLAY_TEST_RESYNC=<tick> (host) asks for a resync of states in
 // step; SSB64_NETPLAY_TEST_DESYNC_BATTLE=<tick> (host) nudges the RNG for 40 ticks from there (a rollback
-// replays over a single nudge).
+// replays over a single RNG nudge) and adds 1% a tick to the first fighter's damage.
 extern s32 sSYUtilsRandomSeed;
 void syNetPeerResyncTestHooks(unsigned int tick)
 {
@@ -2285,7 +2286,15 @@ void syNetPeerResyncTestHooks(unsigned int tick)
 	}
 	if ((desync_at >= 0) && (tick >= (unsigned int)desync_at) && (tick < (unsigned int)desync_at + 40))
 	{
+		// and one fighter's damage (the RNG alone can go unused for 40 ticks)
+		GObj *fighter_gobj = gGCCommonLinks[nGCCommonLinkIDFighter];
+		FTStruct *fp = (fighter_gobj != NULL) ? ftGetStruct(fighter_gobj) : NULL;
+
 		sSYUtilsRandomSeed ^= 0x5bd1e995;
+		if (fp != NULL)
+		{
+			fp->percent_damage++;
+		}
 		if (tick == (unsigned int)desync_at)
 		{
 			port_log("SSB64 Resync: test desync injected at tick %u\n", tick);
@@ -3557,6 +3566,13 @@ void syNetPeerLogConfirmedCheckpoints(void)
 
 		if (sSYNetPeerTickHashTick[slot] != sSYNetPeerNextCheckpointTick)
 		{
+			// a tick that never got a hash (the battle was paused, or not on yet): skip that checkpoint, on both
+			// machines alike. Waiting for it stopped every later check of the match (2026-11-28).
+			if (tick >= sSYNetPeerNextCheckpointTick + 64)
+			{
+				sSYNetPeerNextCheckpointTick += SYNETPEER_LOG_INTERVAL;
+				continue;
+			}
 			break; // this frame's hash is recorded after the frame; try next frame
 		}
 		syNetPeerLogNetSyncValidationWithHash(sSYNetPeerNextCheckpointTick, sSYNetPeerTickHash[slot]);
@@ -4149,7 +4165,6 @@ sb32 syNetPeerCheckRollbackEnabled(void)
 void syNetPeerRecordTickHash(void)
 {
 	u32 tick = syNetInputGetTick();
-
 	sSYNetPeerTickHash[tick % SYNETPEER_TICK_HASH_RING] = syNetSyncHashBattleFighters();
 	sSYNetPeerTickHashTick[tick % SYNETPEER_TICK_HASH_RING] = tick;
 }

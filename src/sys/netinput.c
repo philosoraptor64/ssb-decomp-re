@@ -76,6 +76,21 @@ u32 sSYNetInputPublishedTickCount;
 u32 sSYNetInputPublishedChecksumLimit;
 u32 sSYNetInputPublishedChecksumAtLimit;
 
+// Resync (port/rollback/rollback.cpp): memory that is this machine's own and must not take the host's values:
+// which slots are local or remote (and their last frames), and this tick's hardware reads.
+s32 syNetInputResyncKeep(void **bases, unsigned long *sizes, s32 max)
+{
+	if (max < 2)
+	{
+		return 0;
+	}
+	bases[0] = sSYNetInputSlots;
+	sizes[0] = sizeof(sSYNetInputSlots);
+	bases[1] = sSYNetInputPhysicalDevices;
+	sizes[1] = sizeof(sSYNetInputPhysicalDevices);
+	return 2;
+}
+
 u32 syNetInputGetTick(void)
 {
 	return sSYNetInputTick;
