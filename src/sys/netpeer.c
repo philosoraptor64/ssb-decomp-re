@@ -2177,6 +2177,122 @@ static void syNetPeerNetSendTo(void *user, int player, const uint8_t *data, uint
 }
 
 // A new connection (VS match or online session) starts at the current tick.
+// Resync after a desync (n64net_resync_*, port/rollback/rollback.cpp: battles only, where rollback runs):
+// the host's state comes over with pointers translated. Off unless SSB64_NETPLAY_RESYNC=1 (see below).
+static sb32 sSYNetPeerResyncOn = FALSE;
+static sb32 sSYNetPeerResyncFailed = FALSE;
+static u32 sSYNetPeerResyncsDone = 0;
+extern size_t port_rollback_resync_size(void);
+extern void port_rollback_resync_save(void *user, uint8_t *out);
+extern void port_rollback_resync_load(void *user, const uint8_t *in);
+void syNetPeerSyncCheckReset(void);
+
+static void syNetPeerResyncEnable(void)
+{
+	size_t size;
+
+	sSYNetPeerResyncOn = FALSE;
+	sSYNetPeerResyncFailed = FALSE;
+	sSYNetPeerResyncsDone = 0;
+	// OFF by default (SSB64_NETPLAY_RESYNC=1: on, for tests): a resync of states in step crashed the guest in its
+	// audio a frame after the load. The host's and guest's scheduler queues, coroutine stacks and audio (paced per
+	// device) differ even in step; rollback restores a device's own copy of them, a resync brings the host's.
+	if ((sSYNetPeerNet == NULL) || (getenv("SSB64_NETPLAY_RESYNC") == NULL) || !atoi(getenv("SSB64_NETPLAY_RESYNC")))
+	{
+		return;
+	}
+	size = port_rollback_resync_size();
+	if (size == 0)
+	{
+		port_log("SSB64 Resync: not available here (no snapshot room)\n");
+		return;
+	}
+	sSYNetPeerResyncOn = TRUE;
+	n64net_resync_enable(sSYNetPeerNet, (sSYNetPeerBootstrapIsHost != FALSE) ? 1 : 0, (uint32_t)size,
+	                     port_rollback_resync_save, port_rollback_resync_load, NULL);
+	port_log("SSB64 Resync: on (%u KB state)\n", (unsigned)(size >> 10));
+}
+
+void *syNetPeerResyncNet(void)
+{
+	return (sSYNetPeerResyncOn != FALSE) ? (void *)sSYNetPeerNet : NULL;
+}
+
+// While holding for a resync: give up like a stalled battle would.
+static sb32 syNetPeerCheckPeerSilentFor(u64 usecs);
+static u64 syNetPeerGetGiveUpUsecs(void);
+int syNetPeerResyncPeerGone(void)
+{
+	return (syNetPeerCheckPeerSilentFor(syNetPeerGetGiveUpUsecs()) != FALSE) ? 1 : 0;
+}
+
+// The host's state is loaded here: the fingerprints of the old timeline go.
+void syNetPeerResyncLoaded(void)
+{
+	syNetPeerSyncCheckReset();
+}
+
+// Desync bookkeeping, every poll: a resync that failed (or none possible) ends the match as before; one done
+// lets a later desync be reported (and resynced) again.
+static void syNetPeerResyncPoll(void)
+{
+	u32 done = 0;
+	int status;
+
+	if (sSYNetPeerNet == NULL)
+	{
+		return;
+	}
+	status = (sSYNetPeerResyncOn != FALSE) ? n64net_resync_status(sSYNetPeerNet, NULL, &done)
+	                                       : ((sSYNetPeerDesyncReported != FALSE) ? 2 : 0);
+	if ((status == 2) && (sSYNetPeerDesyncReported != FALSE) && (sSYNetPeerResyncFailed == FALSE))
+	{
+		sSYNetPeerResyncFailed = TRUE;
+		port_net_set_end_reason("The two games got out of step, so the match was stopped. (Both logs have the details.)");
+		port_netplay_alert("The two games have gone out of sync, so what you see may now differ from your "
+		                   "friend's screen. This is a bug: please send both players' logs (Files > BattleShip > ssb64.log).");
+	}
+	if (done != sSYNetPeerResyncsDone)
+	{
+		sSYNetPeerResyncsDone = done;
+		sSYNetPeerDesyncReported = FALSE;
+		syNetPeerSyncCheckReset();
+		port_log("SSB64 Resync: back in step (resync %u)\n", done);
+	}
+}
+
+// Tests (battle frames, rollback.cpp): SSB64_NETPLAY_TEST_RESYNC=<tick> (host) asks for a resync of states in
+// step; SSB64_NETPLAY_TEST_DESYNC_BATTLE=<tick> (host) nudges the RNG for 40 ticks from there (a rollback
+// replays over a single nudge).
+extern s32 sSYUtilsRandomSeed;
+void syNetPeerResyncTestHooks(unsigned int tick)
+{
+	static long resync_at = -2, desync_at = -2;
+
+	if (resync_at == -2)
+	{
+		resync_at = (getenv("SSB64_NETPLAY_TEST_RESYNC") != NULL) ? atoi(getenv("SSB64_NETPLAY_TEST_RESYNC")) : -1;
+		desync_at = (getenv("SSB64_NETPLAY_TEST_DESYNC_BATTLE") != NULL) ? atoi(getenv("SSB64_NETPLAY_TEST_DESYNC_BATTLE")) : -1;
+	}
+	if ((sSYNetPeerBootstrapIsHost == FALSE) || (sSYNetPeerNet == NULL))
+	{
+		return;
+	}
+	if ((resync_at >= 0) && (tick == (unsigned int)resync_at) && (sSYNetPeerResyncOn != FALSE))
+	{
+		n64net_resync_request(sSYNetPeerNet);
+		port_log("SSB64 Resync: test resync requested at tick %u\n", tick);
+	}
+	if ((desync_at >= 0) && (tick >= (unsigned int)desync_at) && (tick < (unsigned int)desync_at + 40))
+	{
+		sSYUtilsRandomSeed ^= 0x5bd1e995;
+		if (tick == (unsigned int)desync_at)
+		{
+			port_log("SSB64 Resync: test desync injected at tick %u\n", tick);
+		}
+	}
+}
+
 static void syNetPeerNetCreate(void)
 {
 	n64net_input_config config;
@@ -2199,10 +2315,12 @@ static void syNetPeerNetCreate(void)
 	config.log = port_log;
 	config.now_usecs = syNetPeerNetNow;
 	sSYNetPeerNet = n64net_input_create(&config);
+	syNetPeerResyncEnable();
 }
 
 static void syNetPeerNetDestroy(void)
 {
+	sSYNetPeerResyncOn = FALSE;
 	if (sSYNetPeerNet != NULL)
 	{
 		n64net_input_destroy(sSYNetPeerNet);
@@ -3021,9 +3139,7 @@ static void syNetPeerSyncCheckCompare(u32 tick, u32 kind, u32 local_hash, u32 re
 	sSYNetPeerDesyncReported = TRUE;
 	port_log("SSB64 NetPeer: DESYNC detected tick=%u kind=%s local=%08X remote=%08X (after %u matching checks)\n",
 	         tick, (kind == 0) ? "session" : "battle", local_hash, remote_hash, sSYNetPeerSyncChecksMatched);
-	port_net_set_end_reason("The two games got out of step, so the match was stopped. (Both logs have the details.)");
-	port_netplay_alert("The two games have gone out of sync, so what you see may now differ from your "
-	                   "friend's screen. This is a bug: please send both players' logs (Files > BattleShip > ssb64.log).");
+	// (the match ends in syNetPeerResyncPoll if there's no resync or it fails)
 }
 
 // Forget all fingerprints (a new session or battle starts at tick 0 again).
@@ -3311,13 +3427,12 @@ void syNetPeerReceiveRemoteInput(void)
 		if (n64net_sync_desynced(sSYNetPeerNet, &tick, &kind))
 		{
 			sSYNetPeerDesyncReported = TRUE;
-			port_log("SSB64 NetPeer: DESYNC detected tick=%u kind=%s (after %u matching checks)\n", tick,
-			         (kind == 0) ? "session" : "battle", n64net_sync_matched(sSYNetPeerNet));
-			port_net_set_end_reason("The two games got out of step, so the match was stopped. (Both logs have the details.)");
-			port_netplay_alert("The two games have gone out of sync, so what you see may now differ from your "
-			                   "friend's screen. This is a bug: please send both players' logs (Files > BattleShip > ssb64.log).");
+			port_log("SSB64 NetPeer: DESYNC detected tick=%u kind=%s (after %u matching checks)%s\n", tick,
+			         (kind == 0) ? "session" : "battle", n64net_sync_matched(sSYNetPeerNet),
+			         (sSYNetPeerResyncOn != FALSE) ? ": getting back in step (resync)" : "");
 		}
 	}
+	syNetPeerResyncPoll();
 #endif
 }
 
